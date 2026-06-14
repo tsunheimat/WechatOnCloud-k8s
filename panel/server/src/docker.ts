@@ -576,7 +576,9 @@ export async function typeInInstance(inst: Instance, text: string): Promise<void
     'export DISPLAY="${display:-:1}"',
     'command -v xclip >/dev/null 2>&1 || { echo "xclip not installed in instance image" >&2; exit 127; }',
     'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
-    `echo '${b64}' | base64 -d | xclip -selection clipboard -i`,
+    // xclip -i 会 daemon 化常驻持有剪贴板选区，并继承 exec 的 stdout/stderr；不重定向的话 docker exec
+    // 要等这俩 fd 关闭，实测每次卡 ~2s。重定向到 /dev/null 后台后，整条链路从 ~2.1s 降到 ~0.08s。
+    `echo '${b64}' | base64 -d | xclip -selection clipboard -i >/dev/null 2>&1`,
     'xdotool key --clearmodifiers ctrl+v',
   ].join('; ');
   await execCapture(inst, ['bash', '-c', cmd]);

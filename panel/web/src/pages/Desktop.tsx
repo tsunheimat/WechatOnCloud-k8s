@@ -50,12 +50,14 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
   };
 
   // 捕获阶段（iframe window 最外层）抢先拦截，赶在 noVNC 之前 → stopImmediatePropagation 阻止它发 keysym。
+  // 关键：队列活跃（有中文正在转发）时，只接管【数字】和回车/退格——它们不参与拼音合成、且是原"混数字丢字"的祸首；
+  // 字母绝不接管，否则会把下一个词的拼音首字母（如"呀"的 y）当成字面字符抢走，造成"你好y呀"。字母交给输入法合成。
   const onKeyDownCapture = (ev: Event) => {
     const e = ev as KeyboardEvent;
-    if (e.isComposing) return; // 拼音合成中，交给输入法
+    if (e.isComposing) return; // 拼音合成中，交给输入法（候选数字选词也在此放行）
     if (e.ctrlKey || e.altKey || e.metaKey) return; // 快捷键放行
     if (!active()) return; // 没有中文在转发 → 不接管（英文/数字走原生 keysym，零延迟）
-    if (e.key.length === 1) {
+    if (/^[0-9]$/.test(e.key)) {
       e.preventDefault();
       e.stopImmediatePropagation();
       queue.push({ kind: 'text', data: e.key });
@@ -123,12 +125,17 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   });
   const setMode = (m: 'forward' | 'seamless') => {
-    setInputMode(m);
     try {
       window.localStorage.setItem('woc_input_mode', m);
+      // 同步写好 enable_ime，重载后新页面的 noVNC 连接时即读到
+      window.localStorage.setItem('enable_ime', m === 'seamless' ? 'true' : 'false');
     } catch {
       /* 隐私模式禁用 localStorage：忽略 */
     }
+    // 整页重载切换：先卸载旧页面（彻底关闭旧 VNC ws），再以新 enable_ime 干净重连。
+    // 不能用页内 bump vncNonce 重挂 iframe——那会让新旧两条 ws 短暂并存，概率性把实例的 Xvnc 卡死
+    //（需重启容器才恢复、面板重启无效），且新连接常读不到新模式（仍是英文）。整页重载是实测唯一可靠的方式。
+    window.location.reload();
   };
   const [imeText, setImeText] = useState('');
   const [imeSending, setImeSending] = useState(false);
