@@ -35,6 +35,7 @@ import {
   type Instance,
 } from './store.js';
 import {
+  runtime,
   ensureNetwork,
   ensureRunning,
   runInstance,
@@ -180,6 +181,11 @@ app.get('/api/version', async (req, reply) => {
   ensureChecked(); // 刚启动还没首检时，触发一次后台检查（不阻塞本次响应）
   return versionInfo();
 });
+// 当前运行时后端（docker / kubernetes）：前端据此切换运维提示与资源标签。任意登录用户可读。
+app.get('/api/runtime', async (req, reply) => {
+  if (!requireAuth(req, reply)) return;
+  return { runtime: runtime.kind };
+});
 // 立即重新检查（管理员，用于「检查更新」按钮）。
 app.post('/api/admin/version/check', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
@@ -278,8 +284,8 @@ app.get('/api/instances', async (req, reply) => {
   const out = await Promise.all(
     visible.map(async (pub) => {
       const inst = findInstance(pub.id)!;
-      const [runtime, wx] = await Promise.all([instanceRuntime(inst), wechatStatus(inst)]);
-      return { ...pub, runtime, wechat: wx };
+      const [rt, wx] = await Promise.all([instanceRuntime(inst), wechatStatus(inst)]);
+      return { ...pub, runtime: rt, wechat: wx };
     }),
   );
   return { instances: out };

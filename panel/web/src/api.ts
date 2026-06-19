@@ -129,6 +129,9 @@ export const api = {
   getVersion: () => req<VersionInfo>('/api/version'),
   checkUpdate: () => req<VersionInfo>('/api/admin/version/check', { method: 'POST' }),
 
+  // 运行时后端（docker / kubernetes）：前端据此切换运维提示与资源标签
+  getRuntime: () => req<{ runtime: 'docker' | 'kubernetes' }>('/api/runtime'),
+
   // 子账号
   listUsers: () => req<{ users: PanelUser[] }>('/api/admin/users'),
   createUser: (username: string, password: string, allowedInstances: string[] = []) =>

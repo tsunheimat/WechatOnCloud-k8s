@@ -137,9 +137,11 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
   const { toast } = useUI();
   const [info, setInfo] = useState<VersionInfo | null>(null);
   const [checking, setChecking] = useState(false);
+  const [runtimeKind, setRuntimeKind] = useState<'docker' | 'kubernetes'>('docker');
 
   useEffect(() => {
     api.getVersion().then(setInfo).catch(() => {});
+    api.getRuntime().then((r) => setRuntimeKind(r.runtime)).catch(() => {});
   }, []);
 
   // 当前版本是否为正式发布版（语义化 vX.Y.Z）。dev / dev-<sha> 等本地构建无法与发布版比较，
@@ -189,7 +191,15 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
         </p>
         {info?.hasUpdate && (
           <div className="ver-hint">
-            在宿主执行 <code>docker compose pull &amp;&amp; docker compose up -d</code> 升级面板；各实例镜像可在「管理 → 升级」单独更新。
+            {runtimeKind === 'kubernetes' ? (
+              <>
+                在集群中更新面板 Deployment 的镜像并重新部署升级面板；各实例镜像可在「管理 → 升级」单独重建。
+              </>
+            ) : (
+              <>
+                在宿主执行 <code>docker compose pull &amp;&amp; docker compose up -d</code> 升级面板；各实例镜像可在「管理 → 升级」单独更新。
+              </>
+            )}
           </div>
         )}
         <div className="settings-actions">
@@ -242,6 +252,8 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
   const [orphanVols, setOrphanVols] = useState<{ name: string; createdAt?: string; sizeBytes?: number }[]>([]);
   // 残留 woc-wx-* 容器（runInstance 启动失败遗留的 Created 容器等）：占着卷名让删卷报 409。
   const [orphanConts, setOrphanConts] = useState<{ id: string; name: string; status: string; volumeName?: string }[]>([]);
+  // 运行时后端：docker 走容器/命名卷，kubernetes 走 Pod/PVC，仅影响清理区的文案与标签。
+  const [runtimeKind, setRuntimeKind] = useState<'docker' | 'kubernetes'>('docker');
   const setAct = (id: string, label: string | null) =>
     setActing((a) => {
       const n = { ...a };
@@ -252,6 +264,24 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
 
   const subs = users.filter((u) => u.role !== 'admin');
   const timer = useRef<number | undefined>(undefined);
+
+  // 清理区文案随运行时切换：docker 模式说「容器 / 数据卷」，kubernetes 模式说「Pod / PVC」。
+  const runtimeLabels =
+    runtimeKind === 'kubernetes'
+      ? {
+          orphanContainerTitle: '未登记 Pod',
+          orphanContainerHelp: '不属于任何登记实例（多为创建失败遗留）；它们占着数据卷名，需先清理它们才能删除同名 PVC。',
+          orphanContainerDeleteBtn: '删除 Pod',
+          orphanVolumeTitle: '未使用的 PVC',
+          orphanVolumeHelp: '删除实例时未勾选「彻底清除」会保留下来；可在新建实例时复用以继承聊天记录。',
+        }
+      : {
+          orphanContainerTitle: '残留容器',
+          orphanContainerHelp: '不属于任何登记实例（多为创建失败遗留）；它们占着数据卷名，需先清理它们才能删除同名数据卷。',
+          orphanContainerDeleteBtn: '删除容器',
+          orphanVolumeTitle: '未使用的数据卷',
+          orphanVolumeHelp: '删除实例时未勾选「彻底清除」会保留下来；可在新建实例时复用以继承聊天记录。',
+        };
 
   const load = async () => {
     if (!isAdmin) return; // 子账号无管理数据权限，管理页只给改密
@@ -272,6 +302,12 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
     try {
       const { containers } = await api.listOrphanContainers();
       setOrphanConts(containers);
+    } catch {
+      /* ignore */
+    }
+    try {
+      const { runtime } = await api.getRuntime();
+      setRuntimeKind(runtime);
     } catch {
       /* ignore */
     }
@@ -510,8 +546,8 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
             {orphanConts.length > 0 && (
               <>
                 <div className="section-row" style={{ marginTop: 22 }}>
-                  <span className="section-title">残留容器</span>
-                  <span className="muted small">不属于任何登记实例（多为创建失败遗留）；它们占着数据卷名，需先清理它们才能删除同名数据卷。</span>
+                  <span className="section-title">{runtimeLabels.orphanContainerTitle}</span>
+                  <span className="muted small">{runtimeLabels.orphanContainerHelp}</span>
                 </div>
                 <div className="inst-grid">
                   {orphanConts.map((c) => (
@@ -527,7 +563,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                       )}
                       <div className="inst-admin-links">
                         <button className="btn-text danger" onClick={() => removeOrphanCont(c)}>
-                          删除容器
+                          {runtimeLabels.orphanContainerDeleteBtn}
                         </button>
                       </div>
                     </div>
@@ -538,8 +574,8 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
             {orphanVols.length > 0 && (
               <>
                 <div className="section-row" style={{ marginTop: 22 }}>
-                  <span className="section-title">未使用的数据卷</span>
-                  <span className="muted small">删除实例时未勾选「彻底清除」会保留下来；可在新建实例时复用以继承聊天记录。</span>
+                  <span className="section-title">{runtimeLabels.orphanVolumeTitle}</span>
+                  <span className="muted small">{runtimeLabels.orphanVolumeHelp}</span>
                 </div>
                 <div className="inst-grid">
                   {orphanVols.map((v) => (
