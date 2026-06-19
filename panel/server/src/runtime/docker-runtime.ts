@@ -1,0 +1,42 @@
+import * as docker from '../docker.js';
+import type { RuntimeDriver } from './types.js';
+
+export const dockerRuntime: RuntimeDriver = {
+  kind: 'docker',
+  ensureRuntimeReady: async () => {
+    await docker.ensureNetwork();
+  },
+  runInstance: docker.runInstance,
+  ensureRunning: docker.ensureRunning,
+  upgradeInstance: docker.upgradeInstance,
+  regenInstanceMachineId: docker.regenInstanceMachineId,
+  stopInstance: docker.stopInstance,
+  removeInstance: docker.removeInstance,
+  listOrphanVolumes: docker.listOrphanVolumes,
+  removeVolume: docker.removeVolume,
+  listOrphanContainers: docker.listOrphanContainers,
+  removeContainerById: docker.removeContainerById,
+  instanceMemoryMB: docker.instanceMemoryMB,
+  instanceHttpHealthy: docker.instanceHttpHealthy,
+  instanceRuntime: docker.instanceRuntime,
+  triggerWechat: docker.triggerWechat,
+  wechatStatus: docker.wechatStatus,
+  buildDiagnostics: docker.buildDiagnostics,
+  uploadToInstance: docker.uploadToInstance,
+  listInstanceFiles: docker.listInstanceFiles,
+  deleteInstanceFile: docker.deleteInstanceFile,
+  downloadFromInstance: docker.downloadFromInstance,
+  instanceLogs: docker.instanceLogs,
+  typeInInstance: docker.typeInInstance,
+  keyInInstance: docker.keyInInstance,
+  listVolume: docker.listVolume,
+  volMkdir: docker.volMkdir,
+  volMove: docker.volMove,
+  volDelete: docker.volDelete,
+  volUploadFile: docker.volUploadFile,
+  volExtractArchive: docker.volExtractArchive,
+  volDownloadFile: docker.volDownloadFile,
+  volBackupStream: docker.volBackupStream,
+  volRestoreArchive: docker.volRestoreArchive,
+  instanceTarget: docker.instanceTarget,
+};
