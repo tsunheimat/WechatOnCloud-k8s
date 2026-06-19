@@ -19,3 +19,7 @@ test('runtime trims and lowercases env input', () => {
 test('runtime rejects unknown input', () => {
   assert.throws(() => runtimeKindFromEnv('compose'), /Unsupported WOC_RUNTIME/);
 });
+
+test('runtime accepts k8s alias', () => {
+  assert.equal(runtimeKindFromEnv('k8s'), 'kubernetes');
+});

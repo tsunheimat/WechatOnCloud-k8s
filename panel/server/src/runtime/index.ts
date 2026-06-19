@@ -1,5 +1,6 @@
 import type { RuntimeKind } from './types.js';
 import { dockerRuntime } from './docker-runtime.js';
+import { kubernetesRuntime } from './kubernetes-runtime.js';
 
 export function runtimeKindFromEnv(value: string | undefined): RuntimeKind {
   const normalized = (value || 'docker').trim().toLowerCase();
@@ -10,10 +11,9 @@ export function runtimeKindFromEnv(value: string | undefined): RuntimeKind {
 
 const selectedKind = runtimeKindFromEnv(process.env.WOC_RUNTIME);
 
-// Task 9/11 replaces the kubernetes branch with the real kubernetesRuntime.
 export const runtime = selectedKind === 'docker'
   ? dockerRuntime
-  : dockerRuntime;
+  : kubernetesRuntime;
 
 // Methods are re-exported bound to `runtime` so that a class-based driver
 // (the Kubernetes runtime) keeps its `this` when called as a free function.
