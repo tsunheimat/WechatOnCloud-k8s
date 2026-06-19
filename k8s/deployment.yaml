@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: woc-panel
+  namespace: wechat-on-cloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wechat-on-cloud
+      app.kubernetes.io/component: panel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wechat-on-cloud
+        app.kubernetes.io/component: panel
+    spec:
+      serviceAccountName: woc-panel
+      containers:
+        - name: panel
+          image: docker.io/gloridust/woc-panel:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: WOC_RUNTIME
+              value: kubernetes
+            - name: WOC_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: WOC_WECHAT_IMAGE
+              value: docker.io/gloridust/wechat-on-cloud:latest
+            - name: PANEL_DATA
+              value: /data/accounts.json
+            - name: PANEL_ADMIN_USER
+              value: admin
+            - name: PANEL_ADMIN_PASSWORD
+              value: wechat
+            - name: TZ
+              value: Asia/Shanghai
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+            - name: PANEL_ALLOWED_HOSTS
+              value: ""
+            - name: WOC_K8S_STORAGE_SIZE
+              value: 10Gi
+            - name: WOC_K8S_IMAGE_PULL_POLICY
+              value: IfNotPresent
+          volumeMounts:
+            - name: panel-data
+              mountPath: /data
+      volumes:
+        - name: panel-data
+          persistentVolumeClaim:
+            claimName: woc-panel-data
