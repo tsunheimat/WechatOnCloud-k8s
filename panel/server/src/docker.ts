@@ -5,6 +5,8 @@ import http from 'node:http';
 import zlib from 'node:zlib';
 import Docker from 'dockerode';
 import { instanceAppType, type Instance } from './store.js';
+import { realisticHostname, realisticMac } from './identity.js';
+import { buildTarGz, tarSingleFile } from './tar.js';
 
 const WECHAT_IMAGE = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
 const PUID = process.env.PUID || '1000';
@@ -29,31 +31,7 @@ const INSTANCE_MEM = INSTANCE_MEM_GB > 0 ? Math.floor(INSTANCE_MEM_GB * 1024 * 1
 // 降低被腾讯按"非真实设备/设备农场"判风险的概率。注意：尽力而为，非保证；详见 doc/设备伪装.md。
 const SPOOF_OS = process.env.WOC_SPOOF_OS !== '0';
 
-// 给实例容器派生一个"像个人电脑"的内部 hostname（替代 woc-wx-<hex> 这种容器/服务器特征）。
-// 从 inst.id 稳定派生：同一实例每次重建得到相同名字、不同实例不同。仅作伪装，不参与寻址
-// （反代用容器名 containerName，不用此 hostname）。
-function realisticHostname(id: string): string {
-  const words = ['deepin', 'lenovo', 'thinkpad', 'matebook', 'xiaoxin', 'legion', 'dell', 'asus', 'desktop', 'home'];
-  let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-  const w = words[h % words.length];
-  const n = ((h >>> 8) % 900) + 100; // 100-999，避免前导 0
-  return `${w}-pc-${n}`;
-}
-
-// 给实例容器派生一个"像真实有线网卡"的 MAC：常见网卡厂商 OUI 前缀 + 由 id 稳定派生的后三段。
-// 容器默认 MAC 带"本地管理位"（第一字节第 2 位为 1，如 02/26/ee 开头），是"非真实硬件"的明显特征；
-// 这里用全局管理、单播的真实厂商 OUI，更像一台插了网卡的真机。同一实例每次重建得到相同 MAC。
-function realisticMac(id: string): string {
-  // 常见消费级网卡厂商 OUI（全局管理 + 单播，首字节低两位为 0）
-  const ouis = ['001b21', '8c1645', '00e04c', '0021cc', '3c970e', '001422', 'b827eb'];
-  let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 131 + id.charCodeAt(i)) >>> 0;
-  const oui = ouis[h % ouis.length];
-  const hex = (n: number) => (n & 0xff).toString(16).padStart(2, '0');
-  const tail = hex(h >>> 3) + hex(h >>> 11) + hex(h >>> 19);
-  return (oui + tail).match(/.{2}/g)!.join(':');
-}
+// 实例设备伪装（hostname/MAC）从 inst.id 稳定派生，已抽到 identity.ts 与 Kubernetes 运行时共享。
 
 const docker = new Docker(); // 默认连 /var/run/docker.sock
 
@@ -488,54 +466,9 @@ export async function pullImage(onProgress?: (line: any) => void): Promise<void>
 // 反向：把微信收到的文件另存到桌面，即可在面板里下载。
 const TRANSFER_DIR = '/config/Desktop';
 
-// 极简单文件 tar 编码（putArchive 需要 tar；避免引入第三方依赖）。
-function tarSingleFile(name: string, content: Buffer): Buffer {
-  const h = Buffer.alloc(512, 0);
-  h.write(name.slice(0, 100), 0, 'utf8'); // name
-  h.write('0000644\0', 100); // mode
-  h.write('0001750\0', 108); // uid 1000(octal 1750)
-  h.write('0001750\0', 116); // gid 1000
-  h.write(content.length.toString(8).padStart(11, '0') + '\0', 124); // size
-  h.write('00000000000\0', 136); // mtime
-  h.write('        ', 148); // checksum 占位（8 空格）
-  h.write('0', 156); // typeflag 普通文件
-  h.write('ustar\0', 257);
-  h.write('00', 263);
-  let sum = 0;
-  for (let i = 0; i < 512; i++) sum += h[i];
-  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148); // 真实校验和
-  const pad = (512 - (content.length % 512)) % 512;
-  return Buffer.concat([h, content, Buffer.alloc(pad, 0), Buffer.alloc(1024, 0)]);
-}
+// tar 编码（tarSingleFile/buildTarGz）已抽到 tar.ts，按字节安全处理多字节文件名，避免重复实现。
 
 // ---------- 诊断包 ----------
-// 单个 tar entry（USTAR header + 内容 + 512 对齐填充），复用与 tarSingleFile 相同的格式。
-function tarEntry(name: string, content: Buffer): Buffer {
-  const h = Buffer.alloc(512, 0);
-  h.write(name.slice(0, 100), 0, 'utf8');
-  h.write('0000644\0', 100);
-  h.write('0001750\0', 108);
-  h.write('0001750\0', 116);
-  h.write(content.length.toString(8).padStart(11, '0') + '\0', 124);
-  h.write('00000000000\0', 136);
-  h.write('        ', 148); // checksum 占位
-  h.write('0', 156); // typeflag 普通文件
-  h.write('ustar\0', 257);
-  h.write('00', 263);
-  let sum = 0;
-  for (let i = 0; i < 512; i++) sum += h[i];
-  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
-  const pad = (512 - (content.length % 512)) % 512;
-  return Buffer.concat([h, content, Buffer.alloc(pad, 0)]);
-}
-
-// 多文件 tar.gz（内存构建；诊断包通常仅数 MB）。文件名用 ASCII 路径避免 utf8 超 100 字节。
-function buildTarGz(entries: { name: string; content: string | Buffer }[]): Buffer {
-  const parts = entries.map((e) => tarEntry(e.name, Buffer.isBuffer(e.content) ? e.content : Buffer.from(e.content, 'utf8')));
-  parts.push(Buffer.alloc(1024, 0)); // 两个空块标记归档结束
-  return zlib.gzipSync(Buffer.concat(parts));
-}
-
 // 汇总诊断包：系统信息 + 面板全局日志 + 每个实例（容器状态 + 持久日志 + 实时日志）+ 全部 woc-* 容器清单。
 // 日志按 sinceMs 时间裁剪。给排查"首个实例创建卡死 / 打开实例黑屏不可用 / 升级失败"等问题用。
 export async function buildDiagnostics(instances: Instance[], sinceMs: number, meta: Record<string, string>): Promise<Buffer> {

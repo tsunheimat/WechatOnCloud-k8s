@@ -40,24 +40,8 @@ export function maybeGunzip(buf: Buffer): Buffer {
   return buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b ? zlib.gunzipSync(buf) : buf;
 }
 
-export function tarSingleFile(name: string, content: Buffer): Buffer {
-  const h = Buffer.alloc(512, 0);
-  h.write(name.slice(0, 100), 0, 'utf8');
-  h.write('0000644\0', 100);
-  h.write('0001750\0', 108);
-  h.write('0001750\0', 116);
-  h.write(content.length.toString(8).padStart(11, '0') + '\0', 124);
-  h.write('00000000000\0', 136);
-  h.write('        ', 148);
-  h.write('0', 156);
-  h.write('ustar\0', 257);
-  h.write('00', 263);
-  let sum = 0;
-  for (let i = 0; i < 512; i++) sum += h[i];
-  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
-  const pad = (512 - (content.length % 512)) % 512;
-  return Buffer.concat([h, content, Buffer.alloc(pad, 0), Buffer.alloc(1024, 0)]);
-}
+// Shared, byte-safe USTAR encoder (handles multibyte filenames / oversized files in one place).
+export { tarSingleFile } from '../tar.js';
 
 export function extractSingleFileFromTar(tar: Buffer): Buffer {
   let off = 0;
@@ -78,6 +62,32 @@ export function extractSingleFileFromTar(tar: Buffer): Buffer {
   return Buffer.alloc(0);
 }
 
+interface ExecStatus {
+  seen: boolean;
+  exitCode: number;
+  message: string;
+}
+
+// k8s.Exec fires this callback with a V1Status when the exec channel closes normally (Success, or
+// Failure carrying the ExitCode). If the websocket dies WITHOUT a status frame — mid-stream network
+// drop, API-server closing the channel, the process being SIGKILLed (OOM / pod teardown) — the callback
+// never fires. Tracking `seen` lets callers treat "closed without a status" as failure instead of
+// silently returning whatever partial output was buffered (for tar: a truncated archive served as success).
+function makeStatusHandler(st: ExecStatus) {
+  return (status: unknown) => {
+    st.seen = true;
+    const s = status as any;
+    if (s?.status === 'Success') {
+      st.exitCode = 0;
+      return;
+    }
+    st.exitCode = Number(s?.details?.causes?.find((c: any) => c.reason === 'ExitCode')?.message) || 1;
+    st.message = s?.message || '';
+  };
+}
+
+const NO_STATUS_ERROR = 'exec 连接异常关闭，未收到结束状态（输出可能不完整）';
+
 export class KubernetesExecHelper {
   private readonly exec: k8s.Exec;
 
@@ -91,7 +101,7 @@ export class KubernetesExecHelper {
   async execCapture(inst: Instance, command: string[], stdin?: Buffer): Promise<string> {
     let out = '';
     let err = '';
-    let exitCode = 0;
+    const st: ExecStatus = { seen: false, exitCode: 0, message: '' };
     const stdout = new Writable({
       write(chunk, _enc, cb) {
         out += Buffer.from(chunk).toString('utf8');
@@ -114,15 +124,14 @@ export class KubernetesExecHelper {
       stderr,
       input,
       false,
-      (status) => {
-        exitCode = Number((status as any)?.details?.causes?.find((c: any) => c.reason === 'ExitCode')?.message || 0);
-      },
+      makeStatusHandler(st),
     );
     await new Promise<void>((resolve, reject) => {
       ws.on('close', () => resolve());
       ws.on('error', reject);
     });
-    if (exitCode !== 0) throw new Error((err || out || `命令执行失败，退出码 ${exitCode}`).trim());
+    if (!st.seen) throw new Error(NO_STATUS_ERROR);
+    if (st.exitCode !== 0) throw new Error((err || out || st.message || `命令执行失败，退出码 ${st.exitCode}`).trim());
     return out || err;
   }
 
@@ -140,7 +149,7 @@ export class KubernetesExecHelper {
       },
     });
     let err = '';
-    let exitCode = 0;
+    const st: ExecStatus = { seen: false, exitCode: 0, message: '' };
     const stderr = new Writable({
       write(chunk, _enc, cb) {
         err += Buffer.from(chunk).toString('utf8');
@@ -156,15 +165,16 @@ export class KubernetesExecHelper {
       stderr,
       null,
       false,
-      (status) => {
-        exitCode = Number((status as any)?.details?.causes?.find((c: any) => c.reason === 'ExitCode')?.message || 0);
-      },
+      makeStatusHandler(st),
     );
     await new Promise<void>((resolve, reject) => {
       ws.on('close', () => resolve());
       ws.on('error', reject);
     });
-    if (exitCode !== 0) throw new Error((err || `tar 读取失败，退出码 ${exitCode}`).trim());
+    // Fail closed: never return a tar that the exec did not confirm finished cleanly, or a downstream
+    // restore/download would treat a truncated archive as valid.
+    if (!st.seen) throw new Error(NO_STATUS_ERROR);
+    if (st.exitCode !== 0) throw new Error((err || st.message || `tar 读取失败，退出码 ${st.exitCode}`).trim());
     return Buffer.concat(chunks);
   }
 
@@ -173,7 +183,7 @@ export class KubernetesExecHelper {
   async getTarStream(inst: Instance, path: string): Promise<NodeJS.ReadableStream> {
     const stdout = new PassThrough();
     let err = '';
-    let exitCode = 0;
+    const st: ExecStatus = { seen: false, exitCode: 0, message: '' };
     const stderr = new Writable({
       write(chunk, _enc, cb) {
         err += Buffer.from(chunk).toString('utf8');
@@ -189,12 +199,15 @@ export class KubernetesExecHelper {
       stderr,
       null,
       false,
-      (status) => {
-        exitCode = Number((status as any)?.details?.causes?.find((c: any) => c.reason === 'ExitCode')?.message || 0);
-      },
+      makeStatusHandler(st),
     );
     ws.on('close', () => {
-      if (exitCode !== 0) stdout.destroy(new Error((err || `tar 读取失败，退出码 ${exitCode}`).trim()));
+      // Destroy (rather than cleanly end) when the exec did not report success or closed without a
+      // status frame — so a backup that drops mid-stream surfaces as a broken download, not a clean EOF
+      // on a truncated archive. Bytes already flushed cannot be un-sent; the route must abort the
+      // HTTP response on stream error.
+      if (!st.seen) stdout.destroy(new Error(NO_STATUS_ERROR));
+      else if (st.exitCode !== 0) stdout.destroy(new Error((err || st.message || `tar 读取失败，退出码 ${st.exitCode}`).trim()));
       else if (!stdout.writableEnded) stdout.end();
     });
     ws.on('error', (e) => stdout.destroy(e as Error));

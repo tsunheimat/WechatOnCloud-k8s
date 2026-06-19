@@ -1,5 +1,6 @@
 import type * as k8s from '@kubernetes/client-node';
 import { instanceAppType, type Instance } from '../store.js';
+import { realisticHostname } from '../identity.js';
 import type { KubernetesRuntimeConfig } from './kubernetes-config.js';
 
 export const INSTANCE_CONTAINER_NAME = 'instance';
@@ -79,8 +80,13 @@ export function buildInstanceService(inst: Instance, cfg: KubernetesRuntimeConfi
 }
 
 export function buildInstancePod(inst: Instance, cfg: KubernetesRuntimeConfig): k8s.V1Pod {
-  const limits: Record<string, string> = {};
-  if (cfg.memoryLimitBytes > 0) limits.memory = String(cfg.memoryLimitBytes);
+  // Always declare modest requests so instances are Burstable rather than BestEffort (first evicted
+  // under node memory pressure). A memory limit is added only when WOC_INSTANCE_MEM_GB is set, matching
+  // the Docker hard cap; the kubelet then OOM-kills + restarts on overrun.
+  const resources: k8s.V1ResourceRequirements = {
+    requests: { cpu: '250m', memory: '512Mi' },
+  };
+  if (cfg.memoryLimitBytes > 0) resources.limits = { memory: String(cfg.memoryLimitBytes) };
 
   return {
     apiVersion: 'v1',
@@ -92,6 +98,12 @@ export function buildInstancePod(inst: Instance, cfg: KubernetesRuntimeConfig): 
     },
     spec: {
       restartPolicy: 'Always',
+      // Internal hostname mimics a personal PC (not the woc-wx-<hex> server/container fingerprint),
+      // mirroring the Docker runtime's anti-detection hostname. The Service name (containerName) remains
+      // the addressable handle and is unaffected. Per-Pod MAC spoofing needs a CNI plugin and is a known
+      // K8s gap (see doc/Kubernetes部署.md).
+      hostname: realisticHostname(inst.id),
+      imagePullSecrets: cfg.imagePullSecret ? [{ name: cfg.imagePullSecret }] : undefined,
       securityContext: {
         seccompProfile: { type: 'Unconfined' },
       },
@@ -106,7 +118,16 @@ export function buildInstancePod(inst: Instance, cfg: KubernetesRuntimeConfig): 
             { name: 'config', mountPath: '/config' },
             { name: 'shm', mountPath: '/dev/shm' },
           ],
-          resources: Object.keys(limits).length ? { limits } : undefined,
+          resources,
+          // Gate the Service endpoint on the port actually listening so the reverse proxy does not route
+          // to a Pod whose KasmVNC is still starting (which would surface as a transient 502 on rebuild).
+          readinessProbe: {
+            tcpSocket: { port: 3000 },
+            initialDelaySeconds: 10,
+            periodSeconds: 10,
+            timeoutSeconds: 3,
+            failureThreshold: 6,
+          },
         },
       ],
       volumes: [

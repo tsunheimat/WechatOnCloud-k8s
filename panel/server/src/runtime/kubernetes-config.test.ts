@@ -5,13 +5,14 @@ import { parseKubernetesRuntimeConfig } from './kubernetes-config.js';
 test('kubernetes runtime config has practical defaults', () => {
   const cfg = parseKubernetesRuntimeConfig({});
   assert.equal(cfg.namespace, 'default');
-  assert.equal(cfg.instanceImage, 'ghcr.io/gloridust/wechat-on-cloud:latest');
+  assert.equal(cfg.instanceImage, 'docker.io/gloridust/wechat-on-cloud:latest');
   assert.equal(cfg.puid, '1000');
   assert.equal(cfg.pgid, '1000');
   assert.equal(cfg.timezone, 'Asia/Shanghai');
   assert.equal(cfg.enableGpu, false);
   assert.equal(cfg.spoofOs, true);
   assert.equal(cfg.imagePullPolicy, 'IfNotPresent');
+  assert.equal(cfg.imagePullSecret, undefined);
   assert.equal(cfg.storageSize, '10Gi');
   assert.equal(cfg.storageClassName, undefined);
 });
@@ -26,6 +27,7 @@ test('kubernetes runtime config reads env overrides', () => {
     WOC_ENABLE_GPU: '1',
     WOC_SPOOF_OS: '0',
     WOC_K8S_IMAGE_PULL_POLICY: 'Always',
+    WOC_K8S_IMAGE_PULL_SECRET: 'regcred',
     WOC_K8S_STORAGE_SIZE: '25Gi',
     WOC_K8S_STORAGE_CLASS: 'fast',
     WOC_INSTANCE_MEM_GB: '3',
@@ -39,6 +41,7 @@ test('kubernetes runtime config reads env overrides', () => {
   assert.equal(cfg.enableGpu, true);
   assert.equal(cfg.spoofOs, false);
   assert.equal(cfg.imagePullPolicy, 'Always');
+  assert.equal(cfg.imagePullSecret, 'regcred');
   assert.equal(cfg.storageSize, '25Gi');
   assert.equal(cfg.storageClassName, 'fast');
   assert.equal(cfg.memoryLimitBytes, 3221225472);

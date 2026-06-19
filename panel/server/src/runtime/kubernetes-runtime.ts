@@ -6,6 +6,7 @@ import { instanceAppType, type Instance } from '../store.js';
 import type { RuntimeDriver, RuntimeState, TransferFile, VolEntry, WechatStatus } from './types.js';
 import { loadKubernetesConfig, parseKubernetesRuntimeConfig } from './kubernetes-config.js';
 import { INSTANCE_CONTAINER_NAME, buildInstancePod, buildInstancePvc, buildInstanceService } from './kubernetes-manifests.js';
+import { buildTarGz } from '../tar.js';
 import {
   KubernetesExecHelper,
   TRANSFER_DIR,
@@ -65,13 +66,17 @@ export class KubernetesRuntime implements RuntimeDriver {
   }
 
   async ensureRuntimeReady(): Promise<void> {
-    await this.core.readNamespace({ name: this.cfg.namespace });
+    // Probe a namespaced resource the panel Role actually grants. (readNamespace would need
+    // cluster-scoped get on `namespaces`, which the namespaced Role does not — and cannot — grant,
+    // so it would always 403 and the readiness check would be dead.)
+    await this.core.listNamespacedPod({ namespace: this.cfg.namespace, limit: 1 });
   }
 
   async runInstance(inst: Instance): Promise<void> {
     await this.ensurePvc(inst);
     await this.ensureService(inst);
-    await this.snapshotPodLog(inst);
+    // deletePod snapshots the dying Pod's logs before removing it, so every teardown path (restart,
+    // upgrade, stop, regen, and watchdog stop+run) preserves them — no separate snapshot needed here.
     await this.deletePod(inst);
     await this.createPod(inst);
     appendInstanceLog(inst.id, 'Pod 已启动');
@@ -163,7 +168,7 @@ export class KubernetesRuntime implements RuntimeDriver {
       };
       const req = http.get(
         {
-          host: inst.containerName,
+          host: `${inst.containerName}.${this.cfg.namespace}`,
           port: 3000,
           path: '/vnc/index.html',
           headers: { authorization: auth },
@@ -353,7 +358,11 @@ export class KubernetesRuntime implements RuntimeDriver {
   }
 
   instanceTarget(inst: Instance): string {
-    return `http://${inst.containerName}:3000`;
+    // Namespace-qualify the Service name so the panel reaches instances even when WOC_K8S_NAMESPACE
+    // points at a namespace other than the one the panel Pod runs in (a bare short name only resolves
+    // within the resolver's own namespace). `<svc>.<ns>` lets the pod's search domains complete it to
+    // the full cluster FQDN, so this stays correct regardless of the cluster DNS domain.
+    return `http://${inst.containerName}.${this.cfg.namespace}:3000`;
   }
 
   private async ensurePvc(inst: Instance): Promise<void> {
@@ -395,6 +404,10 @@ export class KubernetesRuntime implements RuntimeDriver {
   }
 
   private async deletePod(inst: Instance): Promise<void> {
+    // Snapshot the dying Pod's last lines BEFORE deletion — afterwards readNamespacedPodLog returns
+    // NotFound and the crash logs are lost. This is the case the watchdog (stopInstance → runInstance)
+    // depends on, where "上次为何停/崩" matters most. Best-effort: on first create there is no Pod yet.
+    await this.snapshotPodLog(inst);
     try {
       // gracePeriodSeconds: 0 force-deletes immediately (parity with Docker's remove({ force: true })).
       await this.core.deleteNamespacedPod({ namespace: this.cfg.namespace, name: inst.containerName, gracePeriodSeconds: 0 });
@@ -449,31 +462,6 @@ export class KubernetesRuntime implements RuntimeDriver {
       return false;
     }
   }
-}
-
-function tarEntry(name: string, content: Buffer): Buffer {
-  const h = Buffer.alloc(512, 0);
-  h.write(name.slice(0, 100), 0, 'utf8');
-  h.write('0000644\0', 100);
-  h.write('0001750\0', 108);
-  h.write('0001750\0', 116);
-  h.write(content.length.toString(8).padStart(11, '0') + '\0', 124);
-  h.write('00000000000\0', 136);
-  h.write('        ', 148);
-  h.write('0', 156);
-  h.write('ustar\0', 257);
-  h.write('00', 263);
-  let sum = 0;
-  for (let i = 0; i < 512; i++) sum += h[i];
-  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
-  const pad = (512 - (content.length % 512)) % 512;
-  return Buffer.concat([h, content, Buffer.alloc(pad, 0)]);
-}
-
-function buildTarGz(entries: { name: string; content: string | Buffer }[]): Buffer {
-  const parts = entries.map((e) => tarEntry(e.name, Buffer.isBuffer(e.content) ? e.content : Buffer.from(e.content, 'utf8')));
-  parts.push(Buffer.alloc(1024, 0));
-  return zlib.gzipSync(Buffer.concat(parts));
 }
 
 export const kubernetesRuntime = new KubernetesRuntime();

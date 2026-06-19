@@ -1,8 +1,16 @@
+# 示例 Ingress。两点必须配套，否则桌面打不开：
+#   1) 把下面的 host（woc.example.com）填进 Deployment 的 PANEL_ALLOWED_HOSTS，否则面板对真实域名一律 403
+#      （包括 KasmVNC 的 WebSocket 升级请求）。
+#   2) KasmVNC 是长连接 WebSocket，需要 Ingress 允许 WS 升级并放宽读写超时。下面是 ingress-nginx 的注解；
+#      其它控制器（traefik / haproxy 等）请用各自等价配置。
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: woc-panel
   namespace: wechat-on-cloud
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 spec:
   rules:
     - host: woc.example.com

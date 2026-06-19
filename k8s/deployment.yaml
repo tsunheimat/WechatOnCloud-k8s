@@ -58,12 +58,47 @@ spec:
               value: "1000"
             - name: PGID
               value: "1000"
+            # MUST list the external domain(s) you serve the panel on (e.g. via ingress.example.yaml).
+            # An empty value only auto-allows loopback + private IPs, so any real hostname gets 403 —
+            # including the KasmVNC WebSocket upgrade. Comma-separate multiple hosts.
             - name: PANEL_ALLOWED_HOSTS
               value: ""
             - name: WOC_K8S_STORAGE_SIZE
               value: 10Gi
             - name: WOC_K8S_IMAGE_PULL_POLICY
               value: IfNotPresent
+            # Uncomment to pull instance images from a private registry (Secret of type
+            # kubernetes.io/dockerconfigjson in this namespace). The panel adds it to each instance Pod.
+            # - name: WOC_K8S_IMAGE_PULL_SECRET
+            #   value: regcred
+          # Bound the panel so it cannot starve the node and gets a stable QoS class.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          # tcpSocket probes avoid assumptions about which routes are unauthenticated: a wedged panel is
+          # restarted, and the Service only routes once the port is up.
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          # The panel drives the cluster API, so drop everything it does not need. (runAsNonRoot +
+          # runAsUser/fsGroup 1000 is also recommended once the PVC is confirmed writable by uid 1000.)
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: panel-data
               mountPath: /data
