@@ -16,6 +16,11 @@ export interface KubernetesRuntimeConfig {
   storageSize: string;
   storageClassName?: string;
   memoryLimitBytes: number;
+  // When enabled, each instance Pod template carries a `cni.cilium.io/mac-address` annotation set to a
+  // stable realistic MAC (realisticMac(inst.id)), so the app inside the Pod reads a vendor-OUI MAC from
+  // eth0 instead of the container default (local-admin bit). Requires the Cilium CNI; a no-op (ignored)
+  // on other CNIs, so it defaults OFF and is only opt-in via WOC_K8S_CILIUM_MAC_SPOOF=1.
+  ciliumMacSpoof: boolean;
 }
 
 function readNamespaceFromServiceAccount(): string | undefined {
@@ -52,6 +57,7 @@ export function parseKubernetesRuntimeConfig(env: NodeJS.ProcessEnv = process.en
     storageSize: env.WOC_K8S_STORAGE_SIZE || '10Gi',
     storageClassName,
     memoryLimitBytes: memGb > 0 ? Math.floor(memGb * 1024 * 1024 * 1024) : 0,
+    ciliumMacSpoof: env.WOC_K8S_CILIUM_MAC_SPOOF === '1',
   };
 }
 

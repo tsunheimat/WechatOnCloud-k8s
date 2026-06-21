@@ -91,8 +91,14 @@ const DIAG_RANGE_OPTIONS = [
 
 // 「诊断与日志」（仅管理员）：单实例「日志」只记录该实例日志；这里一键打包全局——系统信息 +
 // 面板运维日志 + 全部实例容器状态/日志 + 容器清单，便于排查部署/创建卡死/黑屏不可用等问题。
-function DiagnosticsSection() {
+function DiagnosticsSection({ runtimeKind }: { runtimeKind: 'docker' | 'kubernetes' }) {
   const [range, setRange] = useState('24h');
+  // 诊断包内容随运行时而异：kubernetes 模式打包的是 Pod 状态/日志（system.txt 标注 runtime: kubernetes），
+  // 不含 Docker 信息，故文案需对应，避免运维去找一份并不存在的「Docker 信息 / 容器清单」。
+  const diagDesc =
+    runtimeKind === 'kubernetes'
+      ? '打包系统/Kubernetes 信息 + 面板全局日志 + 各实例 Pod 状态与日志，用于排查部署、创建卡死、黑屏不可用、升级失败等问题。'
+      : '打包系统/Docker 信息 + 面板全局日志 + 各实例容器状态与日志 + 容器清单，用于排查部署、创建卡死、黑屏不可用、升级失败等问题。';
   const exportBundle = () => {
     // tar.gz 带 content-disposition: attachment，用隐藏 <a> 触发下载（带同源 cookie），不离开页面。
     const a = document.createElement('a');
@@ -107,7 +113,7 @@ function DiagnosticsSection() {
         <span className="section-title">诊断与日志</span>
       </div>
       <div className="settings-block">
-        <p className="s-desc">打包系统/Docker 信息 + 面板全局日志 + 各实例容器状态与日志 + 容器清单，用于排查部署、创建卡死、黑屏不可用、升级失败等问题。</p>
+        <p className="s-desc">{diagDesc}</p>
         <div className="s-field">
           <span className="field-label">时间范围</span>
           <div className="chip-row">
@@ -272,15 +278,27 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
           orphanContainerTitle: '未登记 Pod',
           orphanContainerHelp: '不属于任何登记实例（多为创建失败遗留）；它们占着数据卷名，需先清理它们才能删除同名 PVC。',
           orphanContainerDeleteBtn: '删除 Pod',
+          orphanContainerConfirmTitle: (name: string) => `删除未登记 Pod「${name}」？`,
+          orphanContainerConfirmBody: '该 Pod 不属于任何登记实例（多为创建失败遗留）。删除不会动 PVC，删后才能继续清理同名旧 PVC。',
+          orphanContainerDoneToast: '已删除未登记 Pod，可继续清理 PVC',
           orphanVolumeTitle: '未使用的 PVC',
           orphanVolumeHelp: '删除实例时未勾选「彻底清除」会保留下来；可在新建实例时复用以继承聊天记录。',
+          orphanVolumeConfirmTitle: (name: string) => `彻底删除 PVC「${name}」？`,
+          orphanVolumeConfirmBody: '该 PVC 里保存的微信本地数据（聊天记录缓存等）将永久消失，无法恢复。',
+          orphanVolumeDoneToast: '已删除 PVC',
         }
       : {
           orphanContainerTitle: '残留容器',
           orphanContainerHelp: '不属于任何登记实例（多为创建失败遗留）；它们占着数据卷名，需先清理它们才能删除同名数据卷。',
           orphanContainerDeleteBtn: '删除容器',
+          orphanContainerConfirmTitle: (name: string) => `删除残留容器「${name}」？`,
+          orphanContainerConfirmBody: '此容器不属于任何登记实例（多为创建失败遗留）。删除不会动数据卷，删后才能继续清理同名旧数据卷。',
+          orphanContainerDoneToast: '已删除残留容器，可继续清理数据卷',
           orphanVolumeTitle: '未使用的数据卷',
           orphanVolumeHelp: '删除实例时未勾选「彻底清除」会保留下来；可在新建实例时复用以继承聊天记录。',
+          orphanVolumeConfirmTitle: (name: string) => `彻底删除数据卷「${name}」？`,
+          orphanVolumeConfirmBody: '该卷里保存的微信本地数据（聊天记录缓存等）将永久消失，无法恢复。',
+          orphanVolumeDoneToast: '已删除数据卷',
         };
 
   const load = async () => {
@@ -315,15 +333,15 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
 
   const removeOrphanCont = async (c: { id: string; name: string }) => {
     const ok = await confirm({
-      title: `删除残留容器「${c.name}」？`,
-      body: '此容器不属于任何登记实例（多为创建失败遗留）。删除不会动数据卷，删后才能继续清理同名旧数据卷。',
+      title: runtimeLabels.orphanContainerConfirmTitle(c.name),
+      body: runtimeLabels.orphanContainerConfirmBody,
       danger: true,
-      confirmText: '删除容器',
+      confirmText: runtimeLabels.orphanContainerDeleteBtn,
     });
     if (!ok) return;
     try {
       await api.deleteOrphanContainer(c.id);
-      toast('已删除残留容器，可继续清理数据卷', 'ok');
+      toast(runtimeLabels.orphanContainerDoneToast, 'ok');
       setOrphanConts((cs) => cs.filter((x) => x.id !== c.id));
       // 容器走了之后，原本被它占着的卷可能从"被引用"翻成"孤儿"，刷新一次
       try {
@@ -339,15 +357,15 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
 
   const removeOrphanVol = async (name: string) => {
     const ok = await confirm({
-      title: `彻底删除数据卷「${name}」？`,
-      body: '该卷里保存的微信本地数据（聊天记录缓存等）将永久消失，无法恢复。',
+      title: runtimeLabels.orphanVolumeConfirmTitle(name),
+      body: runtimeLabels.orphanVolumeConfirmBody,
       danger: true,
       confirmText: '彻底删除',
     });
     if (!ok) return;
     try {
       await api.deleteOrphanVolume(name);
-      toast('已删除数据卷', 'ok');
+      toast(runtimeLabels.orphanVolumeDoneToast, 'ok');
       setOrphanVols((vs) => vs.filter((v) => v.name !== name));
     } catch (e: any) {
       toast(e.message || '删除失败', 'error');
@@ -471,6 +489,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                   <InstanceAdminCard
                     key={inst.id}
                     inst={inst}
+                    runtimeKind={runtimeKind}
                     userCount={usersForInstance(inst.id).length}
                     acting={acting[inst.id]}
                     onEnter={() => nav(`/i/${inst.id}`)}
@@ -588,7 +607,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                         {typeof v.sizeBytes === 'number' ? `　·　${(v.sizeBytes / 1024 / 1024).toFixed(1)} MB` : ''}
                       </div>
                       <div className="inst-admin-links">
-                        <button className="btn-text" onClick={() => setCreatingInst(true)} title="去「新建实例」对话框，在「数据卷」下拉里选择复用此卷">
+                        <button className="btn-text" onClick={() => setCreatingInst(true)} title={`去「新建实例」对话框，在「${runtimeKind === 'kubernetes' ? 'PVC' : '数据卷'}」下拉里选择复用此卷`}>
                           复用为新实例
                         </button>
                         <button className="btn-text danger" onClick={() => removeOrphanVol(v.name)}>
@@ -622,7 +641,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
           </div>
         </div>
 
-        {isAdmin && <DiagnosticsSection />}
+        {isAdmin && <DiagnosticsSection runtimeKind={runtimeKind} />}
         <AboutSection isAdmin={isAdmin} />
       </main>
 
@@ -639,6 +658,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
       {creatingInst && (
         <CreateInstance
           subs={subs}
+          runtimeKind={runtimeKind}
           onClose={() => setCreatingInst(false)}
           onDone={() => {
             setCreatingInst(false);
@@ -681,6 +701,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
       {deleteInst && (
         <DeleteInstance
           inst={deleteInst}
+          runtimeKind={runtimeKind}
           onClose={() => setDeleteInst(null)}
           onDone={() => {
             setDeleteInst(null);
@@ -703,6 +724,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
       {securityInst && (
         <InstanceSecurity
           inst={securityInst}
+          runtimeKind={runtimeKind}
           onClose={() => setSecurityInst(null)}
           onDone={() => {
             toast('已保存安全阈值', 'ok');
@@ -711,7 +733,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
         />
       )}
       {volumeInst && (
-        <VolumeManager inst={volumeInst} onClose={() => setVolumeInst(null)} onChanged={load} />
+        <VolumeManager inst={volumeInst} runtimeKind={runtimeKind} onClose={() => setVolumeInst(null)} onChanged={load} />
       )}
       {iconInst && (
         <InstanceIconEditor
@@ -810,7 +832,20 @@ function ResetPassword({ user, onClose, onDone }: { user: PanelUser; onClose: ()
 // soft：超过且无人在远程会话时主动重启（柔和自愈，不打扰）
 // hard：超过即强制重启（无视会话，防止 OOM）
 // 留空 = 使用面板全局默认（来自 env）。
-function InstanceSecurity({ inst, onClose, onDone }: { inst: InstanceWithStatus; onClose: () => void; onDone: () => void }) {
+function InstanceSecurity({
+  inst,
+  runtimeKind,
+  onClose,
+  onDone,
+}: {
+  inst: InstanceWithStatus;
+  runtimeKind: 'docker' | 'kubernetes';
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  // Kubernetes 模式没有 metrics-server 时拿不到实例内存（instanceMemoryMB 返回 0），内存阈值自愈不会触发；
+  // 内存上限改由 Pod limits（设 WOC_INSTANCE_MEM_GB 时）+ kubelet OOM 重启保证。设备 ID 重置在两种模式都可用。
+  const memoryWatchdogUnavailable = runtimeKind === 'kubernetes';
   const { toast, confirm } = useUI();
   const [data, setData] = useState<import('../api').MemLimits | null>(null);
   // 输入字段：空串 = "使用默认"（→ 提交时映射为 null）
@@ -920,6 +955,13 @@ function InstanceSecurity({ inst, onClose, onDone }: { inst: InstanceWithStatus;
           <div className="error">{err || '读取失败'}</div>
         ) : (
           <>
+            {memoryWatchdogUnavailable && (
+              <div className="vol-warn">
+                Kubernetes 模式下面板读不到实例内存（需 metrics-server，当前显示为 0），<b>内存阈值自愈不会触发</b>。
+                内存上限请用 Pod <code>limits.memory</code>（设 <code>WOC_INSTANCE_MEM_GB</code>）+ kubelet OOM 重启来保障。
+                下方阈值仅在 Docker 模式生效。「重置设备 ID」在两种模式都可用。
+              </div>
+            )}
             <div className="muted small" style={{ lineHeight: 1.6 }}>
               当 KasmVNC/Xvnc 长跑泄漏内存时，面板的 watchdog 会自动重启实例。两档阈值（单位 MiB）：
               <br />
@@ -999,10 +1041,21 @@ function InstanceSecurity({ inst, onClose, onDone }: { inst: InstanceWithStatus;
   );
 }
 
-function DeleteInstance({ inst, onClose, onDone }: { inst: InstanceWithStatus; onClose: () => void; onDone: () => void }) {
+function DeleteInstance({
+  inst,
+  runtimeKind,
+  onClose,
+  onDone,
+}: {
+  inst: InstanceWithStatus;
+  runtimeKind: 'docker' | 'kubernetes';
+  onClose: () => void;
+  onDone: () => void;
+}) {
   const [purge, setPurge] = useState(false);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  const noun = runtimeKind === 'kubernetes' ? { container: 'Pod', volume: 'PVC' } : { container: '容器', volume: '数据卷' };
   const submit = async () => {
     setErr('');
     setBusy(true);
@@ -1019,12 +1072,12 @@ function DeleteInstance({ inst, onClose, onDone }: { inst: InstanceWithStatus; o
       <div className="card modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 360 }}>
         <h2>删除实例「{inst.name}」？</h2>
         <div className="muted" style={{ fontSize: 14, lineHeight: 1.5 }}>
-          容器会被移除。默认保留聊天记录（数据卷），之后可重建同名实例恢复。
+          {noun.container}会被移除。默认保留聊天记录（{noun.volume}），之后可重建同名实例恢复。
         </div>
         <label className={'purge-opt' + (purge ? ' on' : '')} onClick={() => setPurge((v) => !v)}>
           <span className="purge-check">{purge ? '✓' : ''}</span>
           <span>
-            同时永久删除聊天记录（数据卷）
+            同时永久删除聊天记录（{noun.volume}）
             <span className="muted small" style={{ display: 'block' }}>不可恢复，请谨慎勾选</span>
           </span>
         </label>
@@ -1045,6 +1098,7 @@ function DeleteInstance({ inst, onClose, onDone }: { inst: InstanceWithStatus; o
 // 管理页的实例卡片：含微信版本管理（下载/更新）+ 重命名/分配/删除
 function InstanceAdminCard({
   inst,
+  runtimeKind,
   userCount,
   acting,
   onEnter,
@@ -1061,6 +1115,7 @@ function InstanceAdminCard({
   onIcon,
 }: {
   inst: InstanceWithStatus;
+  runtimeKind: 'docker' | 'kubernetes';
   userCount: number;
   acting?: string;
   onEnter: () => void;
@@ -1094,6 +1149,8 @@ function InstanceAdminCard({
   }, [menuOpen]);
 
   const profile = appProfile(inst.appType);
+  // 资源名词随运行时切换（与清理区 runtimeLabels 同口径）：docker→容器/数据卷，kubernetes→Pod/PVC。
+  const noun = runtimeKind === 'kubernetes' ? { container: 'Pod', volume: 'PVC' } : { container: '容器', volume: '数据卷' };
 
   let badge: { text: string; cls: string };
   if (acting) badge = { text: '处理中', cls: 'tag-busy' };
@@ -1106,7 +1163,15 @@ function InstanceAdminCard({
   if (acting) sub = acting;
   else if (busy) sub = wx.percent >= 0 ? `${wx.message || '处理中'} ${wx.percent}%` : wx.message || '请稍候…';
   else if (wx.phase === 'error') sub = wx.message || '操作失败，可重试';
-  else if (offline) sub = inst.runtime === 'missing' ? '容器尚未创建' : '容器已停止';
+  else if (offline)
+    sub =
+      inst.runtime === 'missing'
+        ? runtimeKind === 'kubernetes'
+          ? 'Pod 尚未创建'
+          : '容器尚未创建'
+        : runtimeKind === 'kubernetes'
+          ? 'Pod 已停止'
+          : '容器已停止';
   else if (installed) sub = wx.version ? `${profile.label} ${wx.version}` : `${profile.label}已就绪`;
   else sub = `${profile.label}尚未安装`;
 
@@ -1185,7 +1250,7 @@ function InstanceAdminCard({
                   <button className="btn-text" onClick={onAssign}>
                     分配账户
                   </button>
-                  <button className="btn-text" onClick={() => window.open(api.instanceLogsUrl(inst.id), '_blank')} title="查看实例日志（含历史：重启原因 + 上一容器日志快照，跨重启保留）">
+                  <button className="btn-text" onClick={() => window.open(api.instanceLogsUrl(inst.id), '_blank')} title={`查看实例日志（含历史：重启原因 + 上一${noun.container}日志快照，跨重启保留）`}>
                     日志
                   </button>
                   <button className="btn-text" onClick={onSecurity} title="内存阈值自愈">
@@ -1194,8 +1259,8 @@ function InstanceAdminCard({
                   <button className="btn-text" onClick={onIcon} title="设置实例图标：内置图标 / 上传图片裁剪">
                     图标
                   </button>
-                  <button className="btn-text" onClick={onVolume} title="数据卷：备份/恢复、上传 PC 微信数据、文件管理">
-                    数据卷
+                  <button className="btn-text" onClick={onVolume} title={`${noun.volume}：备份/恢复、上传 PC 微信数据、文件管理`}>
+                    {noun.volume}
                   </button>
                 </div>
               </div>
@@ -1344,7 +1409,17 @@ function InstanceIconEditor({ inst, onClose, onDone }: { inst: InstanceWithStatu
 // 数据卷管理（仅管理员）：整卷备份/恢复 + 文件浏览器（浏览/上传/解压/下载/改名/移动/删除）。
 // 主要场景：把 PC 微信数据迁移上来、跨实例迁移、离线备份。全程在「运行中」的实例上操作
 // （浏览/改名/删除靠 docker exec，需容器运行）。整卷恢复会覆盖全部数据，强提示并建议恢复后重启实例。
-function VolumeManager({ inst, onClose, onChanged }: { inst: InstanceWithStatus; onClose: () => void; onChanged: () => void }) {
+function VolumeManager({
+  inst,
+  runtimeKind,
+  onClose,
+  onChanged,
+}: {
+  inst: InstanceWithStatus;
+  runtimeKind: 'docker' | 'kubernetes';
+  onClose: () => void;
+  onChanged: () => void;
+}) {
   const { toast, confirm } = useUI();
   const [path, setPath] = useState('');
   const [entries, setEntries] = useState<VolEntry[]>([]);
@@ -1359,6 +1434,10 @@ function VolumeManager({ inst, onClose, onChanged }: { inst: InstanceWithStatus;
   const extractRef = useRef<HTMLInputElement>(null);
   const restoreRef = useRef<HTMLInputElement>(null);
   const offline = inst.runtime !== 'running'; // 文件浏览需实例运行中
+  // K8s 模式下「停止」会删除 Pod，整卷备份/恢复底层走 kubectl exec，必须有运行中的 Pod → 停止时不可用。
+  // Docker 模式可对已停止的容器经 daemon 直接读写文件系统，故离线仍可备份/恢复，保持原行为。
+  const k8sBackupBlocked = runtimeKind === 'kubernetes' && offline;
+  const noun = runtimeKind === 'kubernetes' ? { container: 'Pod', volume: 'PVC' } : { container: '容器', volume: '数据卷' };
 
   const join = (a: string, b: string) => (a ? a + '/' + b : b);
 
@@ -1458,22 +1537,32 @@ function VolumeManager({ inst, onClose, onChanged }: { inst: InstanceWithStatus;
   return (
     <div className="modal-mask" onClick={onClose}>
       <div className="card modal vol-modal" onClick={(e) => e.stopPropagation()}>
-        <h2>数据卷 · {inst.name}</h2>
+        <h2>{noun.volume} · {inst.name}</h2>
 
-        {/* 整卷备份 / 恢复（运行/停止均可用） */}
+        {/* 整卷备份 / 恢复（Docker：运行/停止均可用；Kubernetes：依赖运行中的 Pod，停止时不可用） */}
         <div className="vol-sec">
           <div className="vol-section-label">整卷备份 / 恢复</div>
-          <div className="vol-topbar">
-            <a className="btn" href={api.volumeBackupUrl(inst.id)} target="_blank" rel="noreferrer">下载整卷备份</a>
-            <button className="btn" disabled={disabled} onClick={() => restoreRef.current?.click()}>恢复备份…</button>
-            <input ref={restoreRef} type="file" accept=".gz,.tgz,.tar" hidden onChange={onPick('restore')} />
-          </div>
-          <div className="vol-hint">整卷含聊天记录，用于跨实例迁移 / 离线备份。</div>
+          {k8sBackupBlocked ? (
+            <div className="vol-warn">
+              Kubernetes 模式下实例已停止（Pod 已删除），整卷备份 / 恢复依赖运行中的 Pod，暂不可用。请先在卡片上「启动」实例。
+            </div>
+          ) : (
+            <>
+              <div className="vol-topbar">
+                <a className="btn" href={api.volumeBackupUrl(inst.id)} target="_blank" rel="noreferrer">下载整卷备份</a>
+                <button className="btn" disabled={disabled} onClick={() => restoreRef.current?.click()}>恢复备份…</button>
+                <input ref={restoreRef} type="file" accept=".gz,.tgz,.tar" hidden onChange={onPick('restore')} />
+              </div>
+              <div className="vol-hint">整卷含聊天记录，用于跨实例迁移 / 离线备份。</div>
+            </>
+          )}
         </div>
 
         {offline ? (
           <div className="vol-warn">
-            实例未运行，文件浏览不可用。可执行上方的整卷备份 / 恢复；要浏览或上传单个文件，请先在卡片上启动实例。
+            {k8sBackupBlocked
+              ? '实例未运行（Pod 已删除）。Kubernetes 模式下整卷备份 / 恢复与文件浏览都需要运行中的实例，请先在卡片上启动实例。'
+              : '实例未运行，文件浏览不可用。可执行上方的整卷备份 / 恢复；要浏览或上传单个文件，请先在卡片上启动实例。'}
           </div>
         ) : (
           <div className="vol-sec">
@@ -1699,7 +1788,18 @@ const APP_OPTIONS: { type: AppType; desc: string; ready: boolean }[] = [
   { type: 'custom', desc: '即将支持', ready: false },
 ];
 
-function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose: () => void; onDone: () => void }) {
+function CreateInstance({
+  subs,
+  runtimeKind,
+  onClose,
+  onDone,
+}: {
+  subs: PanelUser[];
+  runtimeKind: 'docker' | 'kubernetes';
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const noun = runtimeKind === 'kubernetes' ? { container: 'Pod', volume: 'PVC' } : { container: '容器', volume: '数据卷' };
   const [name, setName] = useState('');
   const [appType, setAppType] = useState<AppType>('wechat');
   const [sel, setSel] = useState<Set<string>>(new Set());
@@ -1769,7 +1869,7 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
         />
         {orphans.length > 0 && (
           <>
-            <div className="field-label" style={{ marginTop: 12 }}>数据卷（可选）</div>
+            <div className="field-label" style={{ marginTop: 12 }}>{noun.volume}（可选）</div>
             <select className="input" value={reuse} onChange={(e) => setReuse(e.target.value)}>
               <option value="">新建空卷（全新登录）</option>
               {orphans.map((v) => (
@@ -1786,7 +1886,7 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
         )}
         {err && <div className="error">{err}</div>}
         <div className="muted small" style={{ marginTop: 4 }}>
-          创建后拉起一个新的 {APP_LABELS[appType]} 容器；进入实例后点「下载并安装」，再登录即可。
+          创建后拉起一个新的 {APP_LABELS[appType]} {noun.container}；进入实例后点「下载并安装」，再登录即可。
         </div>
         <div className="modal-actions">
           <button type="button" className="btn" onClick={onClose}>

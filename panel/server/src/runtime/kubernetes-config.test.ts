@@ -15,6 +15,7 @@ test('kubernetes runtime config has practical defaults', () => {
   assert.equal(cfg.imagePullSecret, undefined);
   assert.equal(cfg.storageSize, '10Gi');
   assert.equal(cfg.storageClassName, undefined);
+  assert.equal(cfg.ciliumMacSpoof, false);
 });
 
 test('kubernetes runtime config reads env overrides', () => {
@@ -31,6 +32,7 @@ test('kubernetes runtime config reads env overrides', () => {
     WOC_K8S_STORAGE_SIZE: '25Gi',
     WOC_K8S_STORAGE_CLASS: 'fast',
     WOC_INSTANCE_MEM_GB: '3',
+    WOC_K8S_CILIUM_MAC_SPOOF: '1',
   });
 
   assert.equal(cfg.namespace, 'wechat');
@@ -45,4 +47,5 @@ test('kubernetes runtime config reads env overrides', () => {
   assert.equal(cfg.storageSize, '25Gi');
   assert.equal(cfg.storageClassName, 'fast');
   assert.equal(cfg.memoryLimitBytes, 3221225472);
+  assert.equal(cfg.ciliumMacSpoof, true);
 });

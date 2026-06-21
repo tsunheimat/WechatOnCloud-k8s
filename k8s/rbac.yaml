@@ -7,6 +7,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log", "pods/exec", "services", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Each instance is one StatefulSet (woc-wx-<id>); the panel creates it, scales replicas (1=running /
+  # 0=stopped) by replacing the object, and deletes it. No scale subresource is used, so statefulsets/scale
+  # is intentionally omitted.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

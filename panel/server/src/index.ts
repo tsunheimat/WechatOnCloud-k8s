@@ -92,6 +92,13 @@ function basicAuth(inst: Instance) {
   return 'Basic ' + Buffer.from(`${inst.kasmUser}:${inst.kasmPassword}`).toString('base64');
 }
 
+// 运行时相关名词：docker 模式说「容器/数据卷」，kubernetes 模式说「Pod/PVC」。用于运维日志与错误文案，
+// 让管理员在 K8s 部署下看到的提示与实际资源类型一致（清理区的前端文案另由 runtimeLabels 处理）。
+const RT_NOUN =
+  runtime.kind === 'kubernetes'
+    ? { container: 'Pod', volume: 'PVC' }
+    : { container: '容器', volume: '数据卷' };
+
 initStore();
 
 const app = Fastify({ logger: true, trustProxy: true });
@@ -107,7 +114,10 @@ app.addHook('onRequest', async (req, reply) => {
       error: 'Host header not allowed',
       host: parseHost(req.headers.host) || null,
       forwardedHost: req.headers['x-forwarded-host'] || null,
-      hint: '反代部署请把对外域名加入 PANEL_ALLOWED_HOSTS（.env 逗号分隔，支持 *.example.com），改完用 docker compose up -d 重建容器（不是 restart）使其生效',
+      hint:
+        runtime.kind === 'kubernetes'
+          ? '反代部署请把对外域名加入 PANEL_ALLOWED_HOSTS（面板 Deployment 的 env，逗号分隔，支持 *.example.com），改完滚动重启面板 Pod 使其生效'
+          : '反代部署请把对外域名加入 PANEL_ALLOWED_HOSTS（.env 逗号分隔，支持 *.example.com），改完用 docker compose up -d 重建容器（不是 restart）使其生效',
     });
   }
 });
@@ -307,7 +317,7 @@ app.post('/api/instances/:id/heal', async (req, reply) => {
     return { ok: true, restarted: false, message: '近期已尝试恢复，请稍候重连' };
   }
   lastHealAt.set(id, now);
-  appendPanelLog('WARN', `实例「${inst.name}」(id=${id}) 由 ${u.username} 触发卡死自愈（VNC 连不上 → 重启容器，数据保留）`);
+  appendPanelLog('WARN', `实例「${inst.name}」(id=${id}) 由 ${u.username} 触发卡死自愈（VNC 连不上 → 重启${RT_NOUN.container}，数据保留）`);
   try {
     await runInstance(inst);
     return { ok: true, restarted: true };
@@ -344,25 +354,25 @@ app.post('/api/admin/instances', async (req, reply) => {
   let reuseVolumeName: string | undefined;
   if (reuseVolume) {
     if (typeof reuseVolume !== 'string' || !/^woc-data-[0-9a-zA-Z._-]{1,64}$/.test(reuseVolume)) {
-      return reply.code(400).send({ error: '复用卷名不合法' });
+      return reply.code(400).send({ error: `复用${RT_NOUN.volume}名不合法` });
     }
     if (listInstances().some((i) => i.volumeName === reuseVolume)) {
-      return reply.code(409).send({ error: '该数据卷已被另一个实例占用' });
+      return reply.code(409).send({ error: `该${RT_NOUN.volume}已被另一个实例占用` });
     }
     reuseVolumeName = reuseVolume;
   }
   const inst = createInstance(String(name), admin.id, allowedUserIds, reuseVolumeName, type);
   appendPanelLog(
     'INFO',
-    `创建实例「${inst.name}」(${type}, id=${inst.id}) by ${admin.username}${reuseVolumeName ? ` · 复用卷 ${reuseVolumeName}` : ''} → 开始创建容器（镜像缺失会自动拉取，首次较慢）`,
+    `创建实例「${inst.name}」(${type}, id=${inst.id}) by ${admin.username}${reuseVolumeName ? ` · 复用${RT_NOUN.volume} ${reuseVolumeName}` : ''} → 开始创建${RT_NOUN.container}（镜像缺失会自动拉取，首次较慢）`,
   );
   appendInstanceLog(inst.id, `实例创建（${type}）by ${admin.username}`);
   try {
     await runInstance(inst);
   } catch (e: any) {
-    removeInstanceRecord(inst.id); // 容器起不来则回滚登记
+    removeInstanceRecord(inst.id); // 起不来则回滚登记
     appendPanelLog('ERROR', `创建实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
-    return reply.code(500).send({ error: '创建容器失败：' + (e?.message || e) });
+    return reply.code(500).send({ error: `创建${RT_NOUN.container}失败：` + (e?.message || e) });
   }
   appendPanelLog('INFO', `创建实例「${inst.name}」(id=${inst.id}) 成功`);
   return { instance: publicInstance(inst) };
@@ -378,7 +388,7 @@ app.get('/api/admin/orphan-volumes', async (req, reply) => {
     const volumes = await listOrphanVolumes(referenced);
     return { volumes };
   } catch (e: any) {
-    return reply.code(500).send({ error: e?.message || '读取数据卷失败' });
+    return reply.code(500).send({ error: e?.message || `读取${RT_NOUN.volume}失败` });
   }
 });
 
@@ -391,27 +401,36 @@ app.get('/api/admin/orphan-containers', async (req, reply) => {
     const containers = await listOrphanContainers(known);
     return { containers };
   } catch (e: any) {
-    return reply.code(500).send({ error: e?.message || '读取容器失败' });
+    return reply.code(500).send({ error: e?.message || `读取${RT_NOUN.container}失败` });
   }
 });
 
-// 强制删除一个残留容器。仅当它不在 store 的已知容器集中（防误删正在用的实例）。
+// 强制删除一个残留容器/Pod。删除前重算孤儿集，只放行当前确实是「未登记残留」的目标——
+// 否则直接调 API 可删到命名空间内任意 Pod / 宿主上任意容器（列表只列 woc-wx-* 残留，删除却不设限）。
 app.delete('/api/admin/orphan-containers/:idOrName', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const idOrName = (req.params as any).idOrName;
   if (!idOrName || typeof idOrName !== 'string') return reply.code(400).send({ error: '参数不合法' });
   if (listInstances().some((i) => i.containerName === idOrName)) {
-    return reply.code(409).send({ error: '该容器属于现存实例，不能在此删除' });
+    return reply.code(409).send({ error: `该${RT_NOUN.container}属于现存实例，不能在此删除` });
   }
   try {
+    // DELETE 不能比列表更宽松：只允许删除此刻仍在孤儿集中的目标。也收窄了 list→delete 之间的竞态窗口
+    // （如同名卷在期间被新建实例复用）。Docker 列表里 id 是容器 id、name 是容器名，两者都放行。
+    const known = new Set(listInstances().map((i) => i.containerName));
+    const orphans = await listOrphanContainers(known);
+    if (!orphans.some((o) => o.id === idOrName || o.name === idOrName)) {
+      return reply.code(409).send({ error: `该${RT_NOUN.container}不是当前可清理的残留对象（可能已删除或正被使用），请刷新后重试` });
+    }
     await removeContainerById(idOrName);
     return { ok: true };
   } catch (e: any) {
-    return reply.code(500).send({ error: e?.message || '删除容器失败' });
+    return reply.code(500).send({ error: e?.message || `删除${RT_NOUN.container}失败` });
   }
 });
 
-// 显式删除一个未使用的数据卷。被现存实例占用时拒绝（避免误删聊天记录）。
+// 显式删除一个未使用的数据卷/PVC。删除前重算孤儿卷集（含「被未登记 Pod/容器挂载」的排除）：
+// 仅靠 store 引用判断会漏掉残留容器仍挂着的卷——K8s 上删它会卡 Terminating（pvc-protection）或丢聊天数据。
 app.delete('/api/admin/orphan-volumes/:name', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const name = (req.params as any).name;
@@ -419,13 +438,19 @@ app.delete('/api/admin/orphan-volumes/:name', async (req, reply) => {
     return reply.code(400).send({ error: '卷名不合法' });
   }
   if (listInstances().some((i) => i.volumeName === name)) {
-    return reply.code(409).send({ error: '该数据卷正被某个实例使用，不能删除' });
+    return reply.code(409).send({ error: `该${RT_NOUN.volume}正被某个实例使用，不能删除` });
   }
   try {
+    // 与列表同源判定：只放行此刻确实空闲（store 未引用 ∧ 无任何 Pod/容器挂载）的卷，避免删掉仍在用的 PVC。
+    const referenced = new Set(listInstances().map((i) => i.volumeName));
+    const orphans = await listOrphanVolumes(referenced);
+    if (!orphans.some((v) => v.name === name)) {
+      return reply.code(409).send({ error: `该${RT_NOUN.volume}当前不可删除（可能正被未登记的容器/Pod 占用），请刷新后重试` });
+    }
     await removeVolume(name);
     return { ok: true };
   } catch (e: any) {
-    return reply.code(500).send({ error: e?.message || '删除数据卷失败' });
+    return reply.code(500).send({ error: e?.message || `删除${RT_NOUN.volume}失败` });
   }
 });
 
@@ -501,7 +526,7 @@ app.delete('/api/admin/instances/:id', async (req, reply) => {
   const purge = (req.query as any)?.purge === '1' || (req.query as any)?.purge === 'true';
   const inst = findInstance(id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
-  appendPanelLog('INFO', `删除实例「${inst.name}」(id=${id})${purge ? ' · 同时清除数据卷' : ' · 保留数据卷'}`);
+  appendPanelLog('INFO', `删除实例「${inst.name}」(id=${id})${purge ? ` · 同时清除${RT_NOUN.volume}` : ` · 保留${RT_NOUN.volume}`}`);
   await removeInstanceContainer(inst, purge);
   removeInstanceRecord(id);
   controlHolders.delete(id);
@@ -754,12 +779,12 @@ app.get('/api/admin/instances/:id/logs', async (req, reply) => {
   try {
     live = (await instanceLogs(inst)).trimEnd();
   } catch (e: any) {
-    live = '获取本次容器日志失败：' + (e?.message || e);
+    live = `获取本次${RT_NOUN.container}日志失败：` + (e?.message || e);
   }
   if (!history && !live) return reply.send('（暂无日志）');
   if (!history) return reply.send(live);
   return reply.send(
-    `═══ 历史日志（持久化 · 跨重启保留）═══\n${history}\n\n═══ 本次容器日志（实时）═══\n${live || '（本次容器暂无日志）'}`,
+    `═══ 历史日志（持久化 · 跨重启保留）═══\n${history}\n\n═══ 本次${RT_NOUN.container}日志（实时）═══\n${live || `（本次${RT_NOUN.container}暂无日志）`}`,
   );
 });
 

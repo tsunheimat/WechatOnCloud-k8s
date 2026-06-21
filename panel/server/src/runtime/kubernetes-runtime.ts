@@ -5,7 +5,15 @@ import { appendInstanceLog, deleteInstanceLog, filterSince, readInstanceLog, rea
 import { instanceAppType, type Instance } from '../store.js';
 import type { RuntimeDriver, RuntimeState, TransferFile, VolEntry, WechatStatus } from './types.js';
 import { loadKubernetesConfig, parseKubernetesRuntimeConfig } from './kubernetes-config.js';
-import { INSTANCE_CONTAINER_NAME, buildInstancePod, buildInstancePvc, buildInstanceService } from './kubernetes-manifests.js';
+import {
+  INSTANCE_CONTAINER_NAME,
+  buildInstanceHeadlessService,
+  buildInstancePvc,
+  buildInstanceService,
+  buildInstanceStatefulSet,
+  headlessServiceName,
+  podName,
+} from './kubernetes-manifests.js';
 import { buildTarGz } from '../tar.js';
 import {
   KubernetesExecHelper,
@@ -43,6 +51,104 @@ async function ignoreNotFound(fn: () => Promise<unknown>): Promise<void> {
   }
 }
 
+function ownedByStatefulSet(pod: k8s.V1Pod): boolean {
+  return (pod.metadata?.ownerReferences || []).some((r) => r.kind === 'StatefulSet');
+}
+
+// 从命名空间里挑出「未登记的 woc-wx-* 残留工作负载」并转成清理 DTO。两类残留：
+//   1) 残留 StatefulSet（旧实例删除时控制器没删干净，或登记丢失）—— id 用 StatefulSet 名（= containerName）。
+//      删除必须删 StatefulSet 本体（连带其 Pod/Service），只删 Pod 会被控制器立刻重建。
+//   2) 旧版「直连 Pod」（StatefulSet 化之前的运行时遗留的裸 Pod woc-wx-<id>，无 StatefulSet owner）。
+// 关键：已登记实例的 Pod 是 woc-wx-<id>-0，由 StatefulSet 持有（ownedByStatefulSet=true），既不会被当作
+// 裸 Pod 残留，其工作负载名 woc-wx-<id> 又在 known 集里，故不会被误报为孤儿。
+export function selectOrphanWorkloads(
+  statefulSets: k8s.V1StatefulSet[],
+  pods: k8s.V1Pod[],
+  knownContainerNames: Set<string>,
+) {
+  const out: { id: string; name: string; status: string; volumeName?: string }[] = [];
+  const podByName = new Map<string, k8s.V1Pod>();
+  for (const pod of pods || []) {
+    const n = pod.metadata?.name;
+    if (n) podByName.set(n, pod);
+  }
+  const dataClaim = (volumes: k8s.V1Volume[] | undefined): string | undefined =>
+    volumes?.find((v) => v.persistentVolumeClaim?.claimName?.startsWith('woc-data-'))?.persistentVolumeClaim?.claimName;
+
+  for (const ss of statefulSets || []) {
+    const name = ss.metadata?.name;
+    if (!name || !name.startsWith('woc-wx-') || knownContainerNames.has(name)) continue;
+    const pod = podByName.get(`${name}-0`);
+    out.push({
+      id: name,
+      name,
+      // No pod when scaled to 0 — report it as Stopped rather than blank so the admin knows it exists.
+      status: pod?.status?.phase || ((ss.spec?.replicas ?? 0) === 0 ? 'Stopped' : 'Pending'),
+      volumeName: dataClaim(ss.spec?.template?.spec?.volumes) || dataClaim(pod?.spec?.volumes),
+    });
+  }
+  for (const pod of pods || []) {
+    const name = pod.metadata?.name;
+    if (!name || !name.startsWith('woc-wx-') || knownContainerNames.has(name)) continue;
+    // StatefulSet-owned pods are represented by their workload above (or are a registered instance's -0 pod).
+    if (ownedByStatefulSet(pod)) continue;
+    out.push({
+      id: name,
+      name,
+      status: pod.status?.phase || '',
+      volumeName: dataClaim(pod.spec?.volumes),
+    });
+  }
+  return out;
+}
+
+// 收集命名空间内任意 Pod（含未登记 / 失败的残留 Pod）实际挂载的 woc-data-* PVC 名。
+export function mountedDataPvcNames(pods: k8s.V1Pod[]): Set<string> {
+  const names = new Set<string>();
+  for (const pod of pods || []) {
+    for (const v of pod.spec?.volumes || []) {
+      const claim = v.persistentVolumeClaim?.claimName;
+      if (claim && claim.startsWith('woc-data-')) names.add(claim);
+    }
+  }
+  return names;
+}
+
+// 收集所有 StatefulSet 的 Pod 模板里声明的 woc-data-* PVC 名。补 mountedDataPvcNames 的盲区：
+// 已停止（replicas=0，无 Pod）的实例/残留 StatefulSet 仍「拥有」其 PVC，但没有运行 Pod 挂载它——
+// 仅看 Pod 会把它误判成孤儿卷而允许删除，删掉就丢了停机实例的聊天数据。
+export function templateDataPvcNames(statefulSets: k8s.V1StatefulSet[]): Set<string> {
+  const names = new Set<string>();
+  for (const ss of statefulSets || []) {
+    for (const v of ss.spec?.template?.spec?.volumes || []) {
+      const claim = v.persistentVolumeClaim?.claimName;
+      if (claim && claim.startsWith('woc-data-')) names.add(claim);
+    }
+  }
+  return names;
+}
+
+// 判定「未使用的 woc-data-* PVC」：store 视角 ∪ Pod 视角 ∪ StatefulSet 模板视角。仅看 store/Pod 会把
+// 未登记工作负载或停机实例占用的 PVC 误判为孤儿，删除时撞 pvc-protection 卡在 Terminating，或丢数据。
+export function selectOrphanVolumes(
+  pvcs: k8s.V1PersistentVolumeClaim[],
+  pods: k8s.V1Pod[],
+  statefulSets: k8s.V1StatefulSet[],
+  referencedVolumes: Set<string>,
+) {
+  const referenced = new Set<string>([
+    ...referencedVolumes,
+    ...mountedDataPvcNames(pods),
+    ...templateDataPvcNames(statefulSets),
+  ]);
+  return (pvcs || [])
+    .filter((pvc) => pvc.metadata?.name?.startsWith('woc-data-') && !referenced.has(pvc.metadata.name))
+    .map((pvc) => ({
+      name: pvc.metadata!.name!,
+      createdAt: pvc.metadata?.creationTimestamp ? new Date(pvc.metadata.creationTimestamp).toISOString() : undefined,
+    }));
+}
+
 export class KubernetesRuntime implements RuntimeDriver {
   readonly kind = 'kubernetes' as const;
   private readonly cfg = parseKubernetesRuntimeConfig();
@@ -51,6 +157,7 @@ export class KubernetesRuntime implements RuntimeDriver {
   // kubeconfig or contacts the API server.
   private _kubeConfig?: k8s.KubeConfig;
   private _core?: k8s.CoreV1Api;
+  private _apps?: k8s.AppsV1Api;
   private _exec?: KubernetesExecHelper;
 
   private get kubeConfig(): k8s.KubeConfig {
@@ -59,6 +166,10 @@ export class KubernetesRuntime implements RuntimeDriver {
 
   private get core(): k8s.CoreV1Api {
     return (this._core ??= this.kubeConfig.makeApiClient(k8s.CoreV1Api));
+  }
+
+  private get apps(): k8s.AppsV1Api {
+    return (this._apps ??= this.kubeConfig.makeApiClient(k8s.AppsV1Api));
   }
 
   private get exec(): KubernetesExecHelper {
@@ -72,21 +183,39 @@ export class KubernetesRuntime implements RuntimeDriver {
     await this.core.listNamespacedPod({ namespace: this.cfg.namespace, limit: 1 });
   }
 
-  async runInstance(inst: Instance): Promise<void> {
+  // Create or restart the instance running the CURRENT template. Idempotent. `forcePull` (upgrade) flips
+  // the image pull policy to Always so a mutable :latest tag is re-fetched. The pod is only force-recreated
+  // when one already exists — on first create, or after a scale 0→1, the controller starts a fresh pod from
+  // the current template, so no extra restart is needed.
+  async runInstance(inst: Instance, forcePull = false): Promise<void> {
     await this.ensurePvc(inst);
     await this.ensureService(inst);
-    // deletePod snapshots the dying Pod's logs before removing it, so every teardown path (restart,
-    // upgrade, stop, regen, and watchdog stop+run) preserves them — no separate snapshot needed here.
-    await this.deletePod(inst);
-    await this.createPod(inst);
+    await this.ensureHeadlessService(inst);
+    // Migration: a leftover legacy direct Pod named woc-wx-<id> (pre-StatefulSet runtime) shares this
+    // instance's labels, so the Service would load-balance across it AND the StatefulSet pod woc-wx-<id>-0.
+    // It has no owner reference, so GC never reaps it — remove it (exact name, never the -0 pod) up front.
+    await this.deleteLegacyPod(inst);
+    // Wait for the legacy pod to actually disappear so its ReadWriteOnce woc-data-<id> volume detaches
+    // before the StatefulSet pod is scheduled; otherwise woc-wx-<id>-0 can stall on a Multi-Attach error
+    // if it lands on a different node. Best-effort (returns on timeout); a no-op when no legacy pod exists.
+    await this.waitForPodGone(inst.containerName);
+    const hadPod = await this.podExists(inst);
+    await this.applyStatefulSet(inst, 1, forcePull);
+    // updateStrategy:OnDelete means a template change won't auto-roll the pod. If a pod was already running
+    // (restart / upgrade), recreate it to pick up the current template; otherwise the just-(re)started pod is
+    // already fresh.
+    if (hadPod) await this.rollPod(inst);
     appendInstanceLog(inst.id, 'Pod 已启动');
   }
 
   async ensureRunning(inst: Instance): Promise<void> {
     try {
-      const pod = await this.core.readNamespacedPod({ namespace: this.cfg.namespace, name: inst.containerName });
-      if (pod.status?.phase === 'Running' || pod.status?.phase === 'Pending') return;
-      await this.runInstance(inst);
+      const ss = await this.apps.readNamespacedStatefulSet({ namespace: this.cfg.namespace, name: inst.containerName });
+      // Already exists: just ensure it is scaled up. Do NOT route through runInstance — that would force a
+      // needless pod recreate on a healthy instance. The controller (re)creates the pod from the template.
+      if ((ss.spec?.replicas ?? 0) !== 1) {
+        await this.scaleStatefulSet(inst, 1);
+      }
     } catch (e) {
       if (!isNotFoundError(e)) throw e;
       await this.runInstance(inst);
@@ -94,7 +223,8 @@ export class KubernetesRuntime implements RuntimeDriver {
   }
 
   async upgradeInstance(inst: Instance): Promise<void> {
-    await this.runInstance(inst);
+    // Force a fresh image pull so the Upgrade button is true to its text even with a cached :latest.
+    await this.runInstance(inst, true);
   }
 
   async regenInstanceMachineId(inst: Instance): Promise<void> {
@@ -105,18 +235,31 @@ export class KubernetesRuntime implements RuntimeDriver {
       throw new Error('该实例运行的是旧镜像（无设备身份模块），请先「升级实例」后再重置设备 ID');
     }
     await this.exec.execCapture(inst, ['sh', '-c', 'rm -f /config/.woc-machine-id']);
-    await this.stopInstance(inst);
-    await this.runInstance(inst);
+    // Recreate pod woc-wx-<id>-0 (OnDelete → controller rebuilds it) so the identity hook rolls a fresh
+    // machine-id on boot. Keeps replicas=1, so it is a single in-place restart, not a stop+start.
+    await this.rollPod(inst);
   }
 
   async stopInstance(inst: Instance): Promise<void> {
-    await this.deletePod(inst);
+    // Snapshot the dying pod's last lines BEFORE scaling down — afterwards readNamespacedPodLog returns
+    // NotFound and the crash logs are lost.
+    await this.snapshotPodLog(inst);
+    await ignoreNotFound(() => this.scaleStatefulSet(inst, 0));
+    // Scaling is asynchronous; wait until the pod is actually gone so a later restart/instanceRuntime does
+    // not race a still-Terminating woc-wx-<id>-0.
+    await this.waitForPodGone(podName(inst));
     appendInstanceLog(inst.id, 'Pod 已停止');
   }
 
   async removeInstance(inst: Instance, purgeVolume: boolean): Promise<void> {
-    await this.deletePod(inst);
+    await this.snapshotPodLog(inst);
+    // Delete the StatefulSet FIRST so the controller stops recreating the pod; the cascade removes pod -0.
+    await ignoreNotFound(() => this.apps.deleteNamespacedStatefulSet({ namespace: this.cfg.namespace, name: inst.containerName }));
+    await this.waitForPodGone(podName(inst));
     await ignoreNotFound(() => this.core.deleteNamespacedService({ namespace: this.cfg.namespace, name: inst.containerName }));
+    await ignoreNotFound(() => this.core.deleteNamespacedService({ namespace: this.cfg.namespace, name: headlessServiceName(inst) }));
+    // Also clear any legacy direct Pod from the pre-StatefulSet runtime.
+    await ignoreNotFound(() => this.core.deleteNamespacedPod({ namespace: this.cfg.namespace, name: inst.containerName, gracePeriodSeconds: 0 }));
     if (purgeVolume) {
       await ignoreNotFound(() => this.core.deleteNamespacedPersistentVolumeClaim({ namespace: this.cfg.namespace, name: inst.volumeName }));
       deleteInstanceLog(inst.id);
@@ -124,13 +267,12 @@ export class KubernetesRuntime implements RuntimeDriver {
   }
 
   async listOrphanVolumes(referencedVolumes: Set<string>) {
-    const pvcs = await this.core.listNamespacedPersistentVolumeClaim({ namespace: this.cfg.namespace });
-    return (pvcs.items || [])
-      .filter((pvc) => pvc.metadata?.name?.startsWith('woc-data-') && !referencedVolumes.has(pvc.metadata.name))
-      .map((pvc) => ({
-        name: pvc.metadata!.name!,
-        createdAt: pvc.metadata?.creationTimestamp ? new Date(pvc.metadata.creationTimestamp).toISOString() : undefined,
-      }));
+    const [pvcs, pods, sets] = await Promise.all([
+      this.core.listNamespacedPersistentVolumeClaim({ namespace: this.cfg.namespace }),
+      this.core.listNamespacedPod({ namespace: this.cfg.namespace }),
+      this.apps.listNamespacedStatefulSet({ namespace: this.cfg.namespace }),
+    ]);
+    return selectOrphanVolumes(pvcs.items || [], pods.items || [], sets.items || [], referencedVolumes);
   }
 
   async removeVolume(name: string): Promise<void> {
@@ -138,19 +280,32 @@ export class KubernetesRuntime implements RuntimeDriver {
   }
 
   async listOrphanContainers(knownContainerNames: Set<string>) {
-    const pods = await this.core.listNamespacedPod({ namespace: this.cfg.namespace });
-    return (pods.items || [])
-      .filter((pod) => pod.metadata?.name?.startsWith('woc-wx-') && !knownContainerNames.has(pod.metadata.name))
-      .map((pod) => ({
-        id: pod.metadata?.uid || pod.metadata!.name!,
-        name: pod.metadata!.name!,
-        status: pod.status?.phase || '',
-        volumeName: pod.spec?.volumes?.find((v) => v.persistentVolumeClaim?.claimName?.startsWith('woc-data-'))?.persistentVolumeClaim?.claimName,
-      }));
+    const [sets, pods] = await Promise.all([
+      this.apps.listNamespacedStatefulSet({ namespace: this.cfg.namespace }),
+      this.core.listNamespacedPod({ namespace: this.cfg.namespace }),
+    ]);
+    return selectOrphanWorkloads(sets.items || [], pods.items || [], knownContainerNames);
   }
 
   async removeContainerById(idOrName: string): Promise<void> {
-    await this.core.deleteNamespacedPod({ namespace: this.cfg.namespace, name: idOrName });
+    // An orphan is either a StatefulSet (delete the controller + its Services, else the pod is recreated)
+    // or a legacy bare Pod from the pre-StatefulSet runtime. Probe for a StatefulSet first.
+    let isStatefulSet = false;
+    try {
+      await this.apps.readNamespacedStatefulSet({ namespace: this.cfg.namespace, name: idOrName });
+      isStatefulSet = true;
+    } catch (e) {
+      if (!isNotFoundError(e)) throw e;
+    }
+    if (isStatefulSet) {
+      await ignoreNotFound(() => this.apps.deleteNamespacedStatefulSet({ namespace: this.cfg.namespace, name: idOrName }));
+      await ignoreNotFound(() => this.core.deleteNamespacedService({ namespace: this.cfg.namespace, name: idOrName }));
+      await ignoreNotFound(() => this.core.deleteNamespacedService({ namespace: this.cfg.namespace, name: `${idOrName}-headless` }));
+      return;
+    }
+    // Legacy bare pod. Swallow NotFound (it may have self-terminated since the orphan set was computed) so a
+    // successful-in-effect cleanup doesn't surface a 500 — parity with the StatefulSet branch above.
+    await ignoreNotFound(() => this.core.deleteNamespacedPod({ namespace: this.cfg.namespace, name: idOrName }));
   }
 
   async instanceMemoryMB(): Promise<number> {
@@ -190,8 +345,16 @@ export class KubernetesRuntime implements RuntimeDriver {
 
   async instanceRuntime(inst: Instance): Promise<RuntimeState> {
     try {
-      const pod = await this.core.readNamespacedPod({ namespace: this.cfg.namespace, name: inst.containerName });
-      return podPhaseToRuntimeState(pod.status?.phase);
+      const ss = await this.apps.readNamespacedStatefulSet({ namespace: this.cfg.namespace, name: inst.containerName });
+      // replicas=0 is an intentional stop (pod removed); replicas=1 → read the pod's phase.
+      if ((ss.spec?.replicas ?? 0) === 0) return 'stopped';
+      try {
+        const pod = await this.core.readNamespacedPod({ namespace: this.cfg.namespace, name: podName(inst) });
+        return podPhaseToRuntimeState(pod.status?.phase);
+      } catch (e) {
+        if (!isNotFoundError(e)) throw e;
+        return 'stopped'; // scaled up but the pod has not appeared yet → not running
+      }
     } catch (e) {
       if (!isNotFoundError(e)) throw e;
       const hasData = await this.hasPvcOrService(inst);
@@ -229,7 +392,7 @@ export class KubernetesRuntime implements RuntimeDriver {
     for (const [k, v] of Object.entries(meta)) system += `${k}: ${v}\n`;
     entries.push({ name: 'system.txt', content: system });
     for (const inst of instances) {
-      let text = `实例: ${inst.name}\nID: ${inst.id}\nPod: ${inst.containerName}\n类型: ${instanceAppType(inst)}\nPVC: ${inst.volumeName}\n创建: ${inst.createdAt}\n\n`;
+      let text = `实例: ${inst.name}\nID: ${inst.id}\nStatefulSet: ${inst.containerName}\nPod: ${podName(inst)}\n类型: ${instanceAppType(inst)}\nPVC: ${inst.volumeName}\n创建: ${inst.createdAt}\n\n`;
       text += `===== 持久化日志 =====\n${filterSince(readInstanceLog(inst.id), sinceMs) || '（无）'}\n\n`;
       try {
         text += `===== Pod 日志 =====\n${await this.instanceLogs(inst, 300)}\n`;
@@ -265,7 +428,7 @@ export class KubernetesRuntime implements RuntimeDriver {
   }
 
   async instanceLogs(inst: Instance, tail = 600): Promise<string> {
-    return await this.core.readNamespacedPodLog({ namespace: this.cfg.namespace, name: inst.containerName, container: INSTANCE_CONTAINER_NAME, tailLines: tail, timestamps: true });
+    return await this.core.readNamespacedPodLog({ namespace: this.cfg.namespace, name: podName(inst), container: INSTANCE_CONTAINER_NAME, tailLines: tail, timestamps: true });
   }
 
   async typeInInstance(inst: Instance, text: string): Promise<void> {
@@ -361,7 +524,8 @@ export class KubernetesRuntime implements RuntimeDriver {
     // Namespace-qualify the Service name so the panel reaches instances even when WOC_K8S_NAMESPACE
     // points at a namespace other than the one the panel Pod runs in (a bare short name only resolves
     // within the resolver's own namespace). `<svc>.<ns>` lets the pod's search domains complete it to
-    // the full cluster FQDN, so this stays correct regardless of the cluster DNS domain.
+    // the full cluster FQDN, so this stays correct regardless of the cluster DNS domain. The Service name
+    // is still inst.containerName (unchanged by the StatefulSet migration), so this needs no change.
     return `http://${inst.containerName}.${this.cfg.namespace}:3000`;
   }
 
@@ -386,16 +550,34 @@ export class KubernetesRuntime implements RuntimeDriver {
     await this.core.createNamespacedService({ namespace: this.cfg.namespace, body: buildInstanceService(inst, this.cfg) });
   }
 
-  private async createPod(inst: Instance): Promise<void> {
-    const body = buildInstancePod(inst, this.cfg);
+  private async ensureHeadlessService(inst: Instance): Promise<void> {
+    try {
+      await this.core.readNamespacedService({ namespace: this.cfg.namespace, name: headlessServiceName(inst) });
+      return;
+    } catch (e) {
+      if (!isNotFoundError(e)) throw e;
+    }
+    await this.core.createNamespacedService({ namespace: this.cfg.namespace, body: buildInstanceHeadlessService(inst, this.cfg) });
+  }
+
+  // Read the StatefulSet, build the desired body from it, then replace — retrying on 409 Conflict. The
+  // StatefulSet controller bumps resourceVersion via .status writes (readyReplicas/currentRevision/…) during
+  // pod create/roll, so a full PUT can lose the optimistic-lock race in the narrow read→replace window; a
+  // bounded re-read+retry absorbs it. Read NotFound propagates so callers can distinguish "does not exist".
+  private async replaceStatefulSet(
+    name: string,
+    build: (existing: k8s.V1StatefulSet) => k8s.V1StatefulSet,
+  ): Promise<void> {
     for (let attempt = 0; ; attempt++) {
+      const existing = await this.apps.readNamespacedStatefulSet({ namespace: this.cfg.namespace, name });
+      const body = build(existing);
+      body.metadata = { ...body.metadata, resourceVersion: existing.metadata?.resourceVersion };
       try {
-        await this.core.createNamespacedPod({ namespace: this.cfg.namespace, body });
+        await this.apps.replaceNamespacedStatefulSet({ namespace: this.cfg.namespace, name, body });
         return;
       } catch (e) {
-        // A prior Pod with the same name may still be Terminating; wait for it to disappear and retry.
-        if (isConflictError(e) && attempt < 30) {
-          await this.waitForPodGone(inst.containerName, 1000);
+        if (isConflictError(e) && attempt < 5) {
+          await delay(200);
           continue;
         }
         throw e;
@@ -403,21 +585,49 @@ export class KubernetesRuntime implements RuntimeDriver {
     }
   }
 
-  private async deletePod(inst: Instance): Promise<void> {
-    // Snapshot the dying Pod's last lines BEFORE deletion — afterwards readNamespacedPodLog returns
-    // NotFound and the crash logs are lost. This is the case the watchdog (stopInstance → runInstance)
-    // depends on, where "上次为何停/崩" matters most. Best-effort: on first create there is no Pod yet.
-    await this.snapshotPodLog(inst);
+  // Create the StatefulSet, or replace an existing one to apply a new template/replicas. Returns true when
+  // it was freshly created (no pod existed yet). selector/serviceName are derived deterministically from
+  // inst.id and never change, so a replace never hits the immutable-field guard.
+  private async applyStatefulSet(inst: Instance, replicas: number, forcePull: boolean): Promise<boolean> {
     try {
-      // gracePeriodSeconds: 0 force-deletes immediately (parity with Docker's remove({ force: true })).
-      await this.core.deleteNamespacedPod({ namespace: this.cfg.namespace, name: inst.containerName, gracePeriodSeconds: 0 });
+      await this.replaceStatefulSet(inst.containerName, () => buildInstanceStatefulSet(inst, this.cfg, replicas, forcePull));
+      return false;
     } catch (e) {
-      if (isNotFoundError(e)) return;
+      if (!isNotFoundError(e)) throw e;
+      await this.apps.createNamespacedStatefulSet({ namespace: this.cfg.namespace, body: buildInstanceStatefulSet(inst, this.cfg, replicas, forcePull) });
+      return true;
+    }
+  }
+
+  private async scaleStatefulSet(inst: Instance, replicas: number): Promise<void> {
+    await this.replaceStatefulSet(inst.containerName, (existing) => {
+      if (existing.spec) existing.spec.replicas = replicas;
+      return existing;
+    });
+  }
+
+  // Migration helper: best-effort delete a legacy direct Pod whose name is EXACTLY inst.containerName
+  // (no -0 suffix). Never matches the StatefulSet pod woc-wx-<id>-0.
+  private async deleteLegacyPod(inst: Instance): Promise<void> {
+    await ignoreNotFound(() => this.core.deleteNamespacedPod({ namespace: this.cfg.namespace, name: inst.containerName, gracePeriodSeconds: 0 }));
+  }
+
+  private async podExists(inst: Instance): Promise<boolean> {
+    try {
+      await this.core.readNamespacedPod({ namespace: this.cfg.namespace, name: podName(inst) });
+      return true;
+    } catch (e) {
+      if (isNotFoundError(e)) return false;
       throw e;
     }
-    // Deletion is asynchronous — the API accepts it while the Pod lingers in Terminating. Wait until it
-    // is actually gone so a same-named create on rebuild/upgrade/self-heal does not hit a 409 conflict.
-    await this.waitForPodGone(inst.containerName);
+  }
+
+  // Force a fresh pod: snapshot the dying pod's logs, then force-delete woc-wx-<id>-0. The OnDelete
+  // StatefulSet controller recreates it from the current template. No wait — recreation is the controller's
+  // job and the readinessProbe gates the Service endpoint, so traffic only resumes once the new pod is up.
+  private async rollPod(inst: Instance): Promise<void> {
+    await this.snapshotPodLog(inst);
+    await ignoreNotFound(() => this.core.deleteNamespacedPod({ namespace: this.cfg.namespace, name: podName(inst), gracePeriodSeconds: 0 }));
   }
 
   private async waitForPodGone(name: string, timeoutMs = 30000): Promise<void> {
@@ -435,15 +645,15 @@ export class KubernetesRuntime implements RuntimeDriver {
   }
 
   private async snapshotPodLog(inst: Instance): Promise<void> {
-    // Persist the dying Pod's last lines before a rebuild so "上次为何停/崩" survives (parity with
-    // Docker's snapshotContainerLog). Best-effort: on first create there is no Pod yet.
+    // Persist the dying pod's last lines before a rebuild so "上次为何停/崩" survives (parity with
+    // Docker's snapshotContainerLog). Best-effort: on first create / when stopped there is no pod yet.
     try {
       const logs = (await this.instanceLogs(inst, 200)).trimEnd();
       if (logs) {
         appendInstanceLog(inst.id, `──── 容器重建（重启/升级/自愈），保留上一容器最后日志 ────\n${logs}\n──── 上一容器日志快照结束 ────`);
       }
     } catch {
-      /* 首次创建时尚无 Pod，忽略 */
+      /* 尚无 Pod（首次创建 / 已停止），忽略 */
     }
   }
 

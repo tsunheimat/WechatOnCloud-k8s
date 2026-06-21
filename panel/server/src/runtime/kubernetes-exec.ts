@@ -2,7 +2,7 @@ import { PassThrough, Writable } from 'node:stream';
 import zlib from 'node:zlib';
 import * as k8s from '@kubernetes/client-node';
 import type { Instance } from '../store.js';
-import { INSTANCE_CONTAINER_NAME } from './kubernetes-manifests.js';
+import { INSTANCE_CONTAINER_NAME, podName } from './kubernetes-manifests.js';
 
 export const TRANSFER_DIR = '/config/Desktop';
 export const VOL_ROOT = '/config';
@@ -117,7 +117,8 @@ export class KubernetesExecHelper {
     const input = stdin ? PassThrough.from(stdin) : null;
     const ws = await this.exec.exec(
       this.namespace,
-      inst.containerName,
+      // Under a StatefulSet the pod is woc-wx-<id>-0, not the workload/Service name woc-wx-<id>.
+      podName(inst),
       INSTANCE_CONTAINER_NAME,
       asAppUser(command),
       stdout,
@@ -158,7 +159,8 @@ export class KubernetesExecHelper {
     });
     const ws = await this.exec.exec(
       this.namespace,
-      inst.containerName,
+      // Under a StatefulSet the pod is woc-wx-<id>-0, not the workload/Service name woc-wx-<id>.
+      podName(inst),
       INSTANCE_CONTAINER_NAME,
       asAppUser(['tar', '-cf', '-', path]),
       stdout,
@@ -192,7 +194,8 @@ export class KubernetesExecHelper {
     });
     const ws = await this.exec.exec(
       this.namespace,
-      inst.containerName,
+      // Under a StatefulSet the pod is woc-wx-<id>-0, not the workload/Service name woc-wx-<id>.
+      podName(inst),
       INSTANCE_CONTAINER_NAME,
       asAppUser(['tar', '-cf', '-', path]),
       stdout,

@@ -65,8 +65,16 @@ spec:
               value: ""
             - name: WOC_K8S_STORAGE_SIZE
               value: 10Gi
+            # Instance image pull policy. "Upgrade 实例" always forces a fresh pull regardless of this
+            # value, so IfNotPresent is fine for normal starts; set Always only if you also want every
+            # restart to re-check the registry.
             - name: WOC_K8S_IMAGE_PULL_POLICY
               value: IfNotPresent
+            # Stable MAC spoofing for instance Pods via the Cilium CNI annotation
+            # (cni.cilium.io/mac-address). Set to "1" ONLY on clusters running Cilium; other CNIs ignore
+            # the annotation. Existing instances must be recreated ("升级实例"/"重启") to pick up the MAC.
+            - name: WOC_K8S_CILIUM_MAC_SPOOF
+              value: "0"
             # Uncomment to pull instance images from a private registry (Secret of type
             # kubernetes.io/dockerconfigjson in this namespace). The panel adds it to each instance Pod.
             # - name: WOC_K8S_IMAGE_PULL_SECRET
