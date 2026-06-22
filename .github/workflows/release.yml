@@ -1,9 +1,11 @@
 name: release
 
-# 推送 vX.Y.Z 标签或在 GitHub 上发布 Release 时，构建并推送多架构镜像到 GHCR。
-# 也可手动触发（workflow_dispatch）只打 latest，便于验证流水线。
+# 推送 main、vX.Y.Z 标签或在 GitHub 上发布 Release 时，构建并推送多架构镜像到 GHCR。
+# 也可手动触发（workflow_dispatch），便于验证流水线或给 Kubernetes 部署发布测试镜像。
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*.*.*'
   release:
@@ -81,8 +83,10 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
             ${{ vars.DOCKERHUB_USERNAME != '' && format('docker.io/{0}/{1}', vars.DOCKERHUB_USERNAME, matrix.image) || '' }}
-          # 语义化标签：vX.Y.Z → X.Y.Z / X.Y / X；默认分支额外打 latest
+          # 分支发布：main / sha-<短SHA> / latest；语义化标签：vX.Y.Z → X.Y.Z / X.Y / X。
           tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
