@@ -403,10 +403,28 @@ export async function instanceRuntime(inst: Instance): Promise<RuntimeState> {
   }
 }
 
+// 创建 exec 实例。容器 init 未完成时，linuxserver 基镜像的 'abc' 用户可能还没建好，docker 会以
+// 400「unable to find user abc: no matching entries in passwd file」直接拒绝创建 exec（见 issue #74）。
+// 对这种"用户未就绪"错误短暂重试，给容器 init 一点时间；超时则抛清晰的中文错误，而非透传难懂的 docker 400。
+async function execCreate(c: any, opts: any): Promise<any> {
+  let lastErr: any;
+  for (let i = 0; i < 8; i++) {
+    try {
+      return await c.exec(opts);
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      if (!/no matching entries in passwd|unable to find user/i.test(msg)) throw e;
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  throw new Error(`容器仍在初始化（桌面用户未就绪），请等待约十几秒后重试（${lastErr?.message || lastErr}）`);
+}
+
 // 在实例容器内执行命令，返回 stdout；若命令失败，把 stderr 透出给调用方。
 async function execCapture(inst: Instance, cmd: string[]): Promise<string> {
   const c = docker.getContainer(inst.containerName);
-  const exec = await c.exec({ Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: 'abc' });
+  const exec = await execCreate(c, { Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: 'abc' });
   const stream = await exec.start({ hijack: true, stdin: false });
   return await new Promise<string>((resolve, reject) => {
     let out = '';
@@ -437,7 +455,7 @@ export async function triggerWechat(inst: Instance, cmd: 'install' | 'update'): 
   const c = docker.getContainer(inst.containerName);
   const at = instanceAppType(inst);
   const action = cmd === 'update' ? 'update' : 'install';
-  const exec = await c.exec({
+  const exec = await execCreate(c, {
     Cmd: ['bash', '-c', `if [ -x /woc/app-ctl.sh ]; then /woc/app-ctl.sh ${at} ${action}; else /woc/wechat-ctl.sh ${action}; fi`],
     AttachStdout: false,
     AttachStderr: false,

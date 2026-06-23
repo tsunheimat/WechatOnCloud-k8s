@@ -403,13 +403,21 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     const isFocused = () => !document.hidden && document.hasFocus();
     const sync = () => audio.setActive(isFocused());
     sync(); // 初始：若当前已聚焦则立即开声
+    // 关窗/关标签页时彻底断开音频桥（issue #82）：React effect 的清理在直接关闭窗口时不一定执行，
+    // 残留的 audio socket.io（开了麦克风时还占着 getUserMedia）会留在实例上，下次再进与新连接并存，
+    // 把实例顶到"需重启"。pagehide 在页面真正被丢弃（非进 bfcache）时同步断开，避免该残留。
+    const onPageHide = (e: PageTransitionEvent) => {
+      if (!e.persisted) audio.destroy();
+    };
     document.addEventListener('visibilitychange', sync);
     window.addEventListener('focus', sync);
     window.addEventListener('blur', sync);
+    window.addEventListener('pagehide', onPageHide);
     return () => {
       document.removeEventListener('visibilitychange', sync);
       window.removeEventListener('focus', sync);
       window.removeEventListener('blur', sync);
+      window.removeEventListener('pagehide', onPageHide);
       audio.destroy();
       audioRef.current = null;
     };
@@ -623,6 +631,9 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     try {
       await api.typeInInstance(id, t);
       setImeText('');
+      // 发送后把键盘焦点交回虚拟机（issue #81）：字已落进微信输入框，焦点回到桌面后用户再按一次回车
+      // 即可在微信里发出去，省掉用鼠标点「发送」。延迟一拍，等 React 清空输入框、避免被本框抢回焦点。
+      setTimeout(() => focusFrame(), 60);
     } catch (e: any) {
       toast(e?.message || '发送失败：请确认实例已「升级实例」（镜像含 xclip/xdotool）', 'error');
     } finally {
@@ -989,7 +1000,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                     sendImeText();
                   }
                 }}
-                placeholder="中文输入这里 → 回车送进应用（先点好应用的输入框）。Shift+回车换行。"
+                placeholder="中文输入这里 → 回车送进应用（先点好应用的输入框），焦点会自动回到桌面，再按一次回车即发送。Shift+回车换行。"
                 rows={1}
               />
               <button
