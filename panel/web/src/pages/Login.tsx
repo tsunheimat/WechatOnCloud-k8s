@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth';
+import { api } from '../api';
 import { PasswordInput } from '../ui';
 
 export default function Login() {
@@ -10,6 +11,20 @@ export default function Login() {
   const [password, setPassword] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  // SSO：是否启用 + 按钮文案（来自 /api/auth/config）
+  const [sso, setSso] = useState<{ enabled: boolean; displayName: string }>({ enabled: false, displayName: 'SSO' });
+
+  useEffect(() => {
+    api.authConfig().then((c) => setSso(c.oidc)).catch(() => {});
+    // OIDC 回调失败会带 ?sso_error=… 跳回登录页，在此回显
+    const params = new URLSearchParams(window.location.search);
+    const e = params.get('sso_error');
+    if (e) {
+      setErr(e);
+      // 清掉 query，避免刷新后仍显示旧错误
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+  }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -50,6 +65,15 @@ export default function Login() {
           <button className="btn btn-primary" disabled={busy || !username || !password}>
             {busy ? '登录中…' : '登录'}
           </button>
+          {sso.enabled && (
+            <>
+              <div className="login-or">或</div>
+              {/* 整页跳转到服务端发起 OIDC 授权（非 fetch）：会被重定向到 IdP */}
+              <a className="btn login-sso" href="/api/auth/oidc/login">
+                使用 {sso.displayName} 登录
+              </a>
+            </>
+          )}
         </form>
         <div className="login-foot">服务端微信 · 多端共享 · 建议仅在内网 / 可信网络访问</div>
       </div>

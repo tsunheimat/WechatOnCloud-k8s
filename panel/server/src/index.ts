@@ -6,11 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
 import type { Socket } from 'node:net';
+import { randomBytes } from 'node:crypto';
 import {
   initStore,
   findByUsername,
   findById,
   verifyPassword,
+  upsertOidcUser,
+  userAuthProvider,
   publicUser,
   listUsers,
   createSub,
@@ -74,7 +77,9 @@ import {
   volRestoreArchive,
 } from './runtime/index.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
+import { readOidcConfig, buildAuthUrl, handleCallback, endSessionUrl, type OidcTx } from './oidc.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
+import { pickPublicHost } from './request-host.js';
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
@@ -85,6 +90,12 @@ const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '0.0.0.0';
 const STATIC_DIR = process.env.STATIC_DIR || join(__dirname, '../../web/dist');
 const COOKIE = 'woc_sess';
+// OIDC 登录事务用的短时签名 cookie（state/nonce/PKCE），见 oidc.ts。仅作用于回调路径。
+const OIDC_TX_COOKIE = 'woc_oidc';
+const OIDC_TX_PATH = '/api/auth/oidc';
+// 签名密钥：优先 env（设它可让滚动重启期间进行中的 SSO 登录不中断），否则随进程生成。
+const COOKIE_SECRET = process.env.PANEL_COOKIE_SECRET || randomBytes(32).toString('hex');
+const oidc = readOidcConfig();
 // Public hostnames the panel will accept Host headers for, in addition to the
 // always-on loopback + RFC1918 LAN allowlist. Required for HTTPS reverse-proxy
 // deploys (Caddy/nginx/飞牛 内置反代) where the public hostname differs from
@@ -125,7 +136,7 @@ app.addHook('onRequest', async (req, reply) => {
   }
 });
 
-await app.register(cookie);
+await app.register(cookie, { secret: COOKIE_SECRET });
 // 文件上传走原始二进制（前端以 application/octet-stream 直传 File）
 app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
 
@@ -169,6 +180,7 @@ app.post('/api/auth/login', async (req, reply) => {
   reply.setCookie(COOKIE, token, {
     httpOnly: true,
     sameSite: 'lax',
+    secure: cookieSecure(req),
     path: '/',
     maxAge: 60 * 60 * 12,
   });
@@ -176,8 +188,20 @@ app.post('/api/auth/login', async (req, reply) => {
 });
 
 app.post('/api/auth/logout', async (req, reply) => {
-  destroySession(req.cookies?.[COOKIE]);
+  const u = currentUser(req);
+  const token = req.cookies?.[COOKIE];
+  const idTokenHint = getSession(token)?.idToken; // 销毁会话前取出 id_token 作登出 hint
+  destroySession(token);
   reply.clearCookie(COOKIE, { path: '/' });
+  // 配置了 RP-initiated logout 时，对 OIDC 账户返回 IdP 退出地址，前端整页跳转过去（彻底登出 IdP）。
+  // host 取不到合法值就跳过重定向（本地会话已清，注销照样成立），不据伪造头拼 post_logout_redirect_uri。
+  if (oidc.enabled && oidc.postLogout && u && userAuthProvider(u) === 'oidc') {
+    const origin = publicHost(req);
+    if (origin) {
+      const redirect = await endSessionUrl(oidc, `${req.protocol}://${origin}/login`, idTokenHint);
+      if (redirect) return { ok: true, redirect };
+    }
+  }
   return { ok: true };
 });
 
@@ -185,6 +209,98 @@ app.get('/api/auth/me', async (req, reply) => {
   const u = currentUser(req);
   if (!u) return reply.code(401).send({ error: '未登录' });
   return { user: publicUser(u) };
+});
+
+// ---------- OIDC / SSO 登录 ----------
+// 登录页用：未登录即可读，告诉前端是否启用 SSO 及按钮文案（启用时多渲染一颗「用 SSO 登录」）。
+app.get('/api/auth/config', async () => {
+  return { oidc: { enabled: oidc.enabled, displayName: oidc.displayName } };
+});
+
+// 请求对外可见的 host（含端口），用于拼 OIDC 回调 / 注销地址。委托给 request-host：只采信**自身也
+// 通过白名单**的 X-Forwarded-Host（否则回退 Host），并用 URL 规范化挡掉 userinfo 注入（详见该模块）。
+// 两者都不合法时返回 ''，由调用方失败关闭——绝不据伪造的头拼出攻击者可控的 redirect_uri。
+function publicHost(req: FastifyRequest): string {
+  return pickPublicHost(req.headers.host, req.headers['x-forwarded-host'], ALLOWED_HOSTS);
+}
+
+// HTTPS 部署时给 cookie 加 Secure（trustProxy 下 req.protocol 反映 X-Forwarded-Proto）；
+// 纯内网 http 访问时为 false，不破坏「仅局域网明文 http」场景。会话/事务 cookie 据此自适应。
+function cookieSecure(req: FastifyRequest): boolean {
+  return req.protocol === 'https';
+}
+
+// 回调 URL：固定取 OIDC_REDIRECT_URI，否则按反代实际收到的对外来源推导。host 取不到合法值时抛错
+// （失败关闭），由 /oidc/login 的 try/catch 提示用户配置 OIDC_REDIRECT_URI，而不是拼出畸形/可控地址。
+// 注意：反代若改写了 Host/端口，建议显式配 OIDC_REDIRECT_URI 以保证与 IdP 登记完全一致。
+function deriveRedirectUri(req: FastifyRequest): string {
+  if (oidc.redirectUri) return oidc.redirectUri;
+  const host = publicHost(req);
+  if (!host) throw new Error('无法确定面板对外地址，请配置 OIDC_REDIRECT_URI');
+  return `${req.protocol}://${host}/api/auth/oidc/callback`;
+}
+
+// 发起登录：生成事务存进短时签名 cookie，302 到 IdP 授权端点。
+app.get('/api/auth/oidc/login', async (req, reply) => {
+  if (!oidc.enabled) return reply.code(404).send({ error: 'OIDC 未启用' });
+  try {
+    const { url, tx } = await buildAuthUrl(oidc, deriveRedirectUri(req), '/');
+    reply.setCookie(OIDC_TX_COOKIE, JSON.stringify(tx), {
+      signed: true,
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: cookieSecure(req),
+      path: OIDC_TX_PATH,
+      maxAge: 600, // 10 分钟内完成登录
+    });
+    return reply.redirect(url);
+  } catch (e: any) {
+    appendPanelLog('ERROR', `OIDC 登录发起失败：${e?.message || e}`);
+    return reply.redirect('/login?sso_error=' + encodeURIComponent('SSO 暂时不可用，请稍后重试'));
+  }
+});
+
+// 回调：取回事务、换 token、映射/登记账户、建立会话，再跳回面板。
+app.get('/api/auth/oidc/callback', async (req, reply) => {
+  if (!oidc.enabled) return reply.code(404).send({ error: 'OIDC 未启用' });
+  const raw = req.cookies?.[OIDC_TX_COOKIE];
+  const unsigned = raw ? reply.unsignCookie(raw) : null;
+  reply.clearCookie(OIDC_TX_COOKIE, { path: OIDC_TX_PATH });
+  const fail = (msg: string) => reply.redirect('/login?sso_error=' + encodeURIComponent(msg));
+  if (!unsigned || !unsigned.valid || !unsigned.value) {
+    return fail('登录会话已过期或无效，请重试');
+  }
+  let tx: OidcTx;
+  try {
+    tx = JSON.parse(unsigned.value);
+  } catch {
+    return fail('登录会话无效，请重试');
+  }
+  try {
+    const identity = await handleCallback(oidc, (req.query as Record<string, unknown>) ?? {}, tx);
+    const user = upsertOidcUser(identity, {
+      autoCreate: oidc.autoCreate,
+      mapAdmin: !!oidc.adminGroup,
+      // userinfo 抖动导致分组拿不全时不据此降级既有管理员（见 handleCallback.groupsReliable）。
+      adminReliable: identity.groupsReliable,
+    });
+    if (user.disabled) {
+      appendPanelLog('WARN', `OIDC 登录被拒：账户「${user.username}」已禁用`);
+      return fail('该账户已被禁用，请联系管理员');
+    }
+    // 存下 id_token 供登出时作 id_token_hint（RP-initiated logout）。
+    const token = createSession(user.id, identity.idToken);
+    reply.setCookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: cookieSecure(req), path: '/', maxAge: 60 * 60 * 12 });
+    appendPanelLog('INFO', `OIDC 登录：${user.username}（${user.role}）`);
+    // 只允许站内绝对路径回跳；排除协议相对（//host、/\\host）以防开放重定向。
+    // 目前 returnTo 恒为 '/'（且在签名 cookie 内不可篡改），此处为纵深防御，挡未来引入 ?next= 之类的回归。
+    const rt = tx.returnTo;
+    const back = typeof rt === 'string' && rt.startsWith('/') && !rt.startsWith('//') && !rt.startsWith('/\\') ? rt : '/';
+    return reply.redirect(back);
+  } catch (e: any) {
+    appendPanelLog('WARN', `OIDC 登录失败：${e?.message || e}`);
+    return fail(e?.message || 'SSO 登录失败');
+  }
 });
 
 // ---------- 版本与更新检测 ----------
@@ -239,6 +355,7 @@ app.post('/api/admin/desktop-theme', async (req, reply) => {
 app.post('/api/account/password', async (req, reply) => {
   const u = requireAuth(req, reply);
   if (!u) return;
+  if (userAuthProvider(u) === 'oidc') return reply.code(400).send({ error: 'SSO 账户请在身份提供商处管理密码' });
   const { oldPassword, newPassword } = (req.body as any) ?? {};
   if (!verifyPassword(u, oldPassword ?? '')) return reply.code(400).send({ error: '原密码错误' });
   if (!newPassword || String(newPassword).length < 6) return reply.code(400).send({ error: '新密码至少 6 位' });
@@ -280,9 +397,12 @@ app.post('/api/admin/users/:id/instances', async (req, reply) => {
 });
 
 app.post('/api/admin/users/:id/disable', async (req, reply) => {
-  if (!requireAdmin(req, reply)) return;
+  const me = requireAdmin(req, reply);
+  if (!me) return;
   const { disabled } = (req.body as any) ?? {};
   const id = (req.params as any).id;
+  // 防自锁：管理员不能禁用自己（OIDC 管理员现在可被禁用，但禁自己会立刻踢掉自己的会话）。
+  if (id === me.id) return reply.code(400).send({ error: '不能禁用自己' });
   try {
     const user = setDisabled(id, !!disabled);
     if (disabled) destroyUserSessions(id);
@@ -307,8 +427,10 @@ app.post('/api/admin/users/:id/reset', async (req, reply) => {
 });
 
 app.delete('/api/admin/users/:id', async (req, reply) => {
-  if (!requireAdmin(req, reply)) return;
+  const me = requireAdmin(req, reply);
+  if (!me) return;
   const id = (req.params as any).id;
+  if (id === me.id) return reply.code(400).send({ error: '不能删除自己' });
   try {
     deleteUser(id);
     destroyUserSessions(id);

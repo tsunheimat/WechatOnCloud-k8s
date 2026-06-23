@@ -63,6 +63,49 @@ spec:
             # including the KasmVNC WebSocket upgrade. Comma-separate multiple hosts.
             - name: PANEL_ALLOWED_HOSTS
               value: ""
+            # Single sign-on (OIDC, optional). Configure ISSUER + CLIENT_ID + CLIENT_SECRET to enable an
+            # extra "Sign in with SSO" button on the login page; local username/password login is kept.
+            # Secrets come from an optional Secret woc-oidc (see secret.example.yaml); leaving it absent
+            # keeps OIDC disabled. Redirect URI registered at the IdP must be
+            # https://<panel-host>/api/auth/oidc/callback and <panel-host> must be in PANEL_ALLOWED_HOSTS.
+            - name: OIDC_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: woc-oidc
+                  key: issuer
+                  optional: true
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: woc-oidc
+                  key: client_id
+                  optional: true
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: woc-oidc
+                  key: client_secret
+                  optional: true
+            # Non-secret OIDC tuning (safe defaults; uncomment to override). See .env.example for meaning.
+            # - name: OIDC_USERNAME_CLAIM
+            #   value: preferred_username
+            # - name: OIDC_AUTO_CREATE
+            #   value: "true"
+            # - name: OIDC_GROUPS_CLAIM
+            #   value: groups
+            # - name: OIDC_ADMIN_GROUP
+            #   value: ""
+            # - name: OIDC_DISPLAY_NAME
+            #   value: SSO
+            # - name: OIDC_POST_LOGOUT
+            #   value: "false"
+            # Stable cookie-signing secret so in-flight SSO logins survive a panel rollout (optional).
+            - name: PANEL_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: woc-oidc
+                  key: cookie_secret
+                  optional: true
             - name: WOC_K8S_STORAGE_SIZE
               value: 10Gi
             # Instance image pull policy. "Upgrade 实例" always forces a fresh pull regardless of this

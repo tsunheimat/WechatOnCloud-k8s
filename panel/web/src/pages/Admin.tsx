@@ -297,6 +297,9 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
     });
 
   const subs = users.filter((u) => u.role !== 'admin');
+  // 其它管理员（非自己）——主要是经 SSO 分组提升为管理员的账户：需要可见且可吊销，否则
+  // IdP 侧封禁/移除后，本地仍残留一个看不见也删不掉的管理员账户。
+  const otherAdmins = users.filter((u) => u.role === 'admin' && u.id !== user?.id);
   const timer = useRef<number | undefined>(undefined);
 
   // 清理区文案随运行时切换：docker 模式说「容器 / 数据卷」，kubernetes 模式说「Pod / PVC」。
@@ -469,7 +472,17 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
     load();
   };
   const removeUser = async (u: PanelUser) => {
-    const ok = await confirm({ title: `删除子账号「${u.username}」？`, body: '该账户将无法再登录。', danger: true, confirmText: '删除' });
+    const isAdminAcct = u.role === 'admin';
+    const isOidc = u.authProvider === 'oidc';
+    const ok = await confirm({
+      title: `删除${isAdminAcct ? '管理员账户' : '子账号'}「${u.username}」？`,
+      // SSO 账户删除不等于永久封禁：若其在 IdP 仍属（管理员）分组且开了自动建号，下次登录会被重建。
+      body: isOidc
+        ? '该账户将被移除。注意：若其在身份提供商中仍属相应分组且开启了自动建号，下次 SSO 登录会被重新创建；如需「永久吊销」请改用「禁用」。'
+        : '该账户将无法再登录。',
+      danger: true,
+      confirmText: '删除',
+    });
     if (!ok) return;
     try {
       await api.deleteUser(u.id);
@@ -560,6 +573,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                   <div key={u.id} className="inst-card">
                     <div className="inst-head">
                       <span className="inst-name">{u.username}</span>
+                      {u.authProvider === 'oidc' && <span className="tag" title="经 SSO 登录的账户，密码由身份提供商管理">SSO</span>}
                       {u.disabled ? <span className="tag tag-off">已禁用</span> : <span className="tag tag-on">正常</span>}
                     </div>
                     <div className="inst-sub">{u.allowedInstances.length > 0 ? `可访问 ${u.allowedInstances.length} 个实例` : '未分配实例'}</div>
@@ -579,9 +593,12 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                       <button className="btn-text" onClick={() => toggle(u)}>
                         {u.disabled ? '启用' : '禁用'}
                       </button>
-                      <button className="btn-text" onClick={() => setResetTarget(u)}>
-                        重置密码
-                      </button>
+                      {/* SSO 账户无本地密码，重置密码无意义，隐藏 */}
+                      {u.authProvider !== 'oidc' && (
+                        <button className="btn-text" onClick={() => setResetTarget(u)}>
+                          重置密码
+                        </button>
+                      )}
                       <button className="btn-text danger" onClick={() => removeUser(u)}>
                         删除
                       </button>
@@ -590,6 +607,48 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                 ))}
               </div>
             )}
+
+            {otherAdmins.length > 0 && (
+              <>
+                <div className="section-row" style={{ marginTop: 22 }}>
+                  <span className="section-title">其它管理员</span>
+                  <span className="muted small">
+                    经 SSO 分组授予的管理员账户。SSO 管理员可在此即时吊销——「禁用」后即便其在身份提供商仍属管理员组也无法再登录（并立即下线其会话）。
+                  </span>
+                </div>
+                <div className="inst-grid">
+                  {otherAdmins.map((u) => {
+                    const isOidc = u.authProvider === 'oidc';
+                    return (
+                      <div key={u.id} className="inst-card">
+                        <div className="inst-head">
+                          <span className="inst-name">{u.username}</span>
+                          <span className="tag">管理员</span>
+                          {isOidc && <span className="tag">SSO</span>}
+                          {u.disabled && <span className="tag tag-off">已禁用</span>}
+                        </div>
+                        <div className="inst-sub">{isOidc ? '由身份提供商分组授予管理员' : '本地管理员账户'}</div>
+                        <div className="inst-admin-links">
+                          {isOidc ? (
+                            <>
+                              <button className="btn-text" onClick={() => toggle(u)}>
+                                {u.disabled ? '启用' : '禁用'}
+                              </button>
+                              <button className="btn-text danger" onClick={() => removeUser(u)}>
+                                删除
+                              </button>
+                            </>
+                          ) : (
+                            <span className="muted small">本地管理员，受保护，不可在此禁用 / 删除</span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+
             {orphanConts.length > 0 && (
               <>
                 <div className="section-row" style={{ marginTop: 22 }}>
@@ -658,14 +717,20 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
           <div className="inst-card">
             <div className="inst-head">
               <span className="inst-name">{user?.username}</span>
+              {user?.authProvider === 'oidc' && <span className="tag">SSO</span>}
               {isAdmin ? <span className="tag">管理员</span> : <span className="tag tag-on">子账号</span>}
             </div>
             <div className="inst-sub">{isAdmin ? '可访问全部实例' : `可访问 ${user?.allowedInstances.length ?? 0} 个实例`}</div>
-            <div className="inst-actions">
-              <button className="btn btn-primary inst-act-wide" onClick={onChangePassword}>
-                修改密码
-              </button>
-            </div>
+            {/* SSO 账户无本地密码，密码在身份提供商处管理 */}
+            {user?.authProvider === 'oidc' ? (
+              <div className="inst-sub muted">经 SSO 登录，密码请在身份提供商处管理</div>
+            ) : (
+              <div className="inst-actions">
+                <button className="btn btn-primary inst-act-wide" onClick={onChangePassword}>
+                  修改密码
+                </button>
+              </div>
+            )}
           </div>
         </div>
 

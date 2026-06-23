@@ -3,14 +3,16 @@ import { randomBytes } from 'node:crypto';
 interface Session {
   userId: string;
   expires: number;
+  // OIDC 登录时保存的 id_token，登出时作 id_token_hint 传给 IdP 的 end_session（RP-initiated logout）。
+  idToken?: string;
 }
 
 const TTL_MS = 1000 * 60 * 60 * 12; // 12 小时
 const sessions = new Map<string, Session>();
 
-export function createSession(userId: string) {
+export function createSession(userId: string, idToken?: string) {
   const token = randomBytes(32).toString('hex');
-  sessions.set(token, { userId, expires: Date.now() + TTL_MS });
+  sessions.set(token, { userId, expires: Date.now() + TTL_MS, idToken });
   return token;
 }
 

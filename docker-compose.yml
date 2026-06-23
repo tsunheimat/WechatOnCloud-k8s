@@ -38,6 +38,20 @@ services:
       # DNS-rebinding 防护：套 HTTPS 反代部署时把对外域名加进 .env（详见 .env.example）。
       # 默认仅放行 loopback + RFC1918 私网，直连 NAS / 局域网无需改动。
       - PANEL_ALLOWED_HOSTS=${PANEL_ALLOWED_HOSTS:-}
+      # 单点登录 / SSO（OIDC，可选）：配齐 ISSUER/CLIENT_ID/CLIENT_SECRET 即启用，详见 .env.example。
+      # 不配 = 不启用，登录页只有本地用户名密码。
+      - OIDC_ISSUER=${OIDC_ISSUER:-}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:-}
+      - OIDC_REDIRECT_URI=${OIDC_REDIRECT_URI:-}
+      - OIDC_SCOPES=${OIDC_SCOPES:-}
+      - OIDC_USERNAME_CLAIM=${OIDC_USERNAME_CLAIM:-}
+      - OIDC_AUTO_CREATE=${OIDC_AUTO_CREATE:-}
+      - OIDC_GROUPS_CLAIM=${OIDC_GROUPS_CLAIM:-}
+      - OIDC_ADMIN_GROUP=${OIDC_ADMIN_GROUP:-}
+      - OIDC_DISPLAY_NAME=${OIDC_DISPLAY_NAME:-}
+      - OIDC_POST_LOGOUT=${OIDC_POST_LOGOUT:-}
+      - PANEL_COOKIE_SECRET=${PANEL_COOKIE_SECRET:-}
 
     volumes:
       # 面板账号数据（用户、实例元信息、密码哈希）

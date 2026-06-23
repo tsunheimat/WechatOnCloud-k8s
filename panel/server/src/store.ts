@@ -5,12 +5,23 @@ import bcrypt from 'bcryptjs';
 
 export type Role = 'admin' | 'sub';
 
+// 账户来源：local = 本地用户名密码；oidc = 经外部 IdP（SSO）登录、自动/手动登记的账户。
+// 缺省（旧账号文件无此字段）= local，见 userAuthProvider / initStore 迁移。
+export type AuthProvider = 'local' | 'oidc';
+
 export interface User {
   id: string;
   username: string;
   role: Role;
+  // 本地账户的 bcrypt 口令哈希；OIDC 账户无本地口令，为空串（verifyPassword 直接拒绝）。
   passwordHash: string;
   disabled: boolean;
+  // 账户来源。缺省视为 'local'（见 userAuthProvider）。
+  authProvider?: AuthProvider;
+  // OIDC 账户的稳定主体标识（id_token 的 sub）；身份只按它匹配，用户名仅作显示名。
+  oidcSubject?: string;
+  // OIDC 账户的邮箱（若 IdP 提供），仅作展示/审计。
+  email?: string;
   createdAt: string;
   // 该账户可访问的微信实例 id 列表。admin 隐式全部，忽略此字段。
   allowedInstances: string[];
@@ -101,23 +112,37 @@ export function initStore() {
   } else {
     data = { users: [], instances: [] };
   }
-  // 迁移：补齐新增字段，兼容旧账号文件
+  // 迁移：补齐新增字段，兼容旧账号文件；并修复手工编辑（如离线预登记 OIDC 用户）可能缺失/重复的
+  // 关键运行时字段。id 缺失会让会话键到 undefined、多个无 id 用户在 findById 时坍缩成同一条；
+  // createdAt 缺失会让 listUsers 的排序在 localeCompare 上抛错。这里统一补齐并去重 id（兜底防呆）。
   if (!Array.isArray(data.instances)) data.instances = [];
+  const seenIds = new Set<string>();
   for (const u of data.users) {
     if (!Array.isArray(u.allowedInstances)) u.allowedInstances = [];
+    // 旧账号文件无 authProvider：一律视为本地账户（有 oidcSubject 的才是 OIDC）。
+    if (!u.authProvider) u.authProvider = u.oidcSubject ? 'oidc' : 'local';
+    // id 缺失或与已见 id 重复 → 生成新的唯一 id（避免身份坍缩）。
+    if (!u.id || seenIds.has(u.id)) u.id = randomUUID();
+    seenIds.add(u.id);
+    if (!u.createdAt) u.createdAt = new Date().toISOString();
   }
-  if (!data.users.some((u) => u.role === 'admin')) {
+  // 确保始终有一个**本地**管理员作为「保命」账户。只检查「有没有管理员」是不够的：若部署只手工
+  // 预登记了 OIDC 管理员（闭环登记流程），那些 OIDC 管理员可被单独禁用/删除、也可能因 IdP 抖动/移出
+  // 分组而降级——一旦清空就再无任何管理员，且 OIDC 账户的离线密码找回被禁用，等于永久锁死。本地管理员
+  // 受保护、永不可禁用/删除（见 setDisabled/deleteUser），故这里以「本地管理员」为基准兜底。
+  // 正常部署首启就有本地管理员，此分支不触发；仅 OIDC-only 的新部署会补建一个。
+  if (!data.users.some((u) => u.role === 'admin' && userAuthProvider(u) === 'local')) {
     const username = process.env.PANEL_ADMIN_USER || 'admin';
     const password = process.env.PANEL_ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
     const admin = makeUser(username, password, 'admin');
     // 用默认密码初始化时标记，提醒尽快改密
     if (password === DEFAULT_ADMIN_PASSWORD) admin.mustChangePassword = true;
     data.users.push(admin);
-    console.log(`[store] 已初始化管理员账号 '${username}'`);
+    console.log(`[store] 已初始化本地管理员账号 '${username}'`);
   } else {
-    // 兼容旧账号文件：管理员若仍能用默认密码登录，补打"需改密"标记
+    // 兼容旧账号文件：本地管理员若仍能用默认密码登录，补打"需改密"标记（OIDC 管理员无本地口令，跳过）
     for (const u of data.users) {
-      if (u.role === 'admin' && u.mustChangePassword === undefined) {
+      if (u.role === 'admin' && userAuthProvider(u) === 'local' && u.mustChangePassword === undefined) {
         u.mustChangePassword = bcrypt.compareSync(DEFAULT_ADMIN_PASSWORD, u.passwordHash);
       }
     }
@@ -126,6 +151,13 @@ export function initStore() {
   // → 重启面板。这里把其密码重置为 PANEL_ADMIN_PASSWORD（默认 wechat）、解禁，并清除标记。
   for (const u of data.users) {
     if ((u as any).resetPassword === true || (u as any).reset_password === true) {
+      // SSO 账户无本地口令，离线恢复对它无意义：清掉标记并跳过，绝不写哈希制造本地登录后门。
+      if (userAuthProvider(u) === 'oidc') {
+        delete (u as any).resetPassword;
+        delete (u as any).reset_password;
+        console.log(`[store] 跳过 SSO 账户 '${u.username}' 的离线密码重置（SSO 账户无本地口令，请在 IdP 处管理）`);
+        continue;
+      }
       const pw = process.env.PANEL_ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
       u.passwordHash = bcrypt.hashSync(pw, 10);
       u.mustChangePassword = pw === DEFAULT_ADMIN_PASSWORD; // 重置成默认密码则提示尽快改密
@@ -153,6 +185,10 @@ export function setDesktopDark(v: boolean) {
 }
 
 // ---------- 用户 ----------
+export function userAuthProvider(u: User): AuthProvider {
+  return u.authProvider || (u.oidcSubject ? 'oidc' : 'local');
+}
+
 export function publicUser(u: User) {
   return {
     id: u.id,
@@ -162,11 +198,16 @@ export function publicUser(u: User) {
     createdAt: u.createdAt,
     allowedInstances: u.role === 'admin' ? [] : u.allowedInstances,
     mustChangePassword: !!u.mustChangePassword,
+    authProvider: userAuthProvider(u),
   };
 }
 
 export function findByUsername(username: string) {
   return data.users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+}
+
+export function findByOidcSubject(subject: string) {
+  return data.users.find((u) => u.oidcSubject === subject);
 }
 
 export function findById(id: string) {
@@ -181,6 +222,10 @@ export function listUsers() {
 }
 
 export function verifyPassword(u: User, password: string) {
+  // SSO 账户只能走 IdP：即便账号文件里因离线恢复/手改/迁移被写入了口令哈希，也一律拒绝本地登录。
+  // 不靠「passwordHash 为空」来判定——那只是常态，不是不变量。
+  if (userAuthProvider(u) === 'oidc') return false;
+  if (!u.passwordHash) return false;
   return bcrypt.compareSync(password, u.passwordHash);
 }
 
@@ -193,10 +238,80 @@ export function createSub(username: string, password: string, allowedInstances: 
   return publicUser(u);
 }
 
+// OIDC 登录：按稳定 subject 匹配既有账户并对账（邮箱 / 管理员角色），否则按 autoCreate 决定是否
+// JIT 建号。身份只认 subject —— 用户名仅作显示名，撞名时自动加后缀去重（绝不接管既有账户）。
+//   identity: 归一化后的 IdP 身份（见 oidc.normalizeIdentity）
+//   opts.autoCreate: 未登记身份是否自动建号（OIDC_AUTO_CREATE）
+//   opts.mapAdmin: 是否据 IdP 分组对账管理员角色（仅在配置了 OIDC_ADMIN_GROUP 时为 true）
+//   opts.adminReliable: 本次「分组判定」是否可信（见 oidc.handleCallback 的 groupsReliable）。缺省视为
+//     可信。为 false 时跳过「据分组降级管理员」，避免 userinfo 抖动把既有管理员误降级。
+export interface OidcUpsertIdentity {
+  subject: string;
+  username: string;
+  email?: string;
+  isAdmin: boolean;
+}
+export function upsertOidcUser(
+  identity: OidcUpsertIdentity,
+  opts: { autoCreate: boolean; mapAdmin: boolean; adminReliable?: boolean },
+): User {
+  const adminReliable = opts.adminReliable !== false; // 缺省可信
+  const existing = findByOidcSubject(identity.subject);
+  if (existing) {
+    // 每次登录对账：刷新邮箱，并据当前配置重算角色（仅作用于 OIDC 账户）。
+    let changed = false;
+    if (identity.email && existing.email !== identity.email) {
+      existing.email = identity.email;
+      changed = true;
+    }
+    // 角色回算：未配 OIDC_ADMIN_GROUP（mapAdmin=false）→ 与分组无关，强制 sub（收回任何旧 OIDC 管理员，
+    // 支持「清空分组配置即降级」）。配了分组：仅当本次分组判定可信(adminReliable)时才据分组升/降级；
+    // 不可信（多为 userinfo 抖动）则保留现状，绝不把管理员误降级。
+    let role: Role | null = null;
+    if (!opts.mapAdmin) role = 'sub';
+    else if (adminReliable) role = identity.isAdmin ? 'admin' : 'sub';
+    if (role !== null && existing.role !== role) {
+      existing.role = role;
+      changed = true;
+    }
+    if (changed) persist();
+    return existing;
+  }
+  if (!opts.autoCreate) {
+    throw new Error('该账户尚未在面板登记（OIDC_AUTO_CREATE=false）');
+  }
+  // 用户名仅作显示名，身份只认 subject。撞名不接管既有账户——改用带后缀的唯一显示名，既防接管，
+  // 也避免两个 preferred_username 相同的不同 IdP 用户互相把对方挡在门外。
+  let username = identity.username;
+  if (findByUsername(username)) {
+    let n = 2;
+    while (findByUsername(`${identity.username}-${n}`)) n++;
+    username = `${identity.username}-${n}`;
+  }
+  const u: User = {
+    id: randomUUID(),
+    username,
+    role: opts.mapAdmin && adminReliable && identity.isAdmin ? 'admin' : 'sub',
+    passwordHash: '', // 无本地口令
+    disabled: false,
+    authProvider: 'oidc',
+    oidcSubject: identity.subject,
+    email: identity.email,
+    createdAt: new Date().toISOString(),
+    allowedInstances: [],
+  };
+  data.users.push(u);
+  persist();
+  return u;
+}
+
 export function setDisabled(id: string, disabled: boolean) {
   const u = findById(id);
   if (!u) throw new Error('用户不存在');
-  if (u.role === 'admin') throw new Error('不能禁用管理员');
+  // 本地管理员是「保命」账户（离线找回的落点），永不可禁用，避免把所有人锁在外面；
+  // OIDC 管理员则允许禁用，作为对 SSO 管理员的即时本地吊销——禁用后即便其在 IdP 仍属管理员组，
+  // 回调处也会拒绝 disabled 账户，无法再登录（且 disable 路由会立刻销毁其在线会话）。
+  if (u.role === 'admin' && userAuthProvider(u) !== 'oidc') throw new Error('不能禁用本地管理员');
   u.disabled = disabled;
   persist();
   return publicUser(u);
@@ -205,6 +320,8 @@ export function setDisabled(id: string, disabled: boolean) {
 export function resetPassword(id: string, password: string) {
   const u = findById(id);
   if (!u) throw new Error('用户不存在');
+  // SSO 账户无本地口令：拒绝设密码，否则会给本只能走 IdP 的账户开一条本地登录后门。
+  if (userAuthProvider(u) === 'oidc') throw new Error('SSO 账户无本地密码，请在身份提供商处管理');
   u.passwordHash = bcrypt.hashSync(password, 10);
   u.mustChangePassword = false; // 改过密就不再提示
   persist();
@@ -214,7 +331,9 @@ export function resetPassword(id: string, password: string) {
 export function deleteUser(id: string) {
   const u = findById(id);
   if (!u) throw new Error('用户不存在');
-  if (u.role === 'admin') throw new Error('不能删除管理员');
+  // 同 setDisabled：本地管理员受保护；OIDC 管理员可删除。注意删除并非永久封禁——若其在 IdP 仍属
+  // 管理员组且开了自动建号，下次 SSO 登录会被重新创建；要「永久吊销」请用「禁用」。
+  if (u.role === 'admin' && userAuthProvider(u) !== 'oidc') throw new Error('不能删除本地管理员');
   data.users = data.users.filter((x) => x.id !== id);
   persist();
 }

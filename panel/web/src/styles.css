@@ -162,6 +162,27 @@ button {
   text-align: center;
   padding: 0 12px;
 }
+/* 本地登录与 SSO 之间的「或」分隔线 */
+.login-or {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 2px 0;
+}
+.login-or::before,
+.login-or::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border, rgba(127 127 127 / 0.2));
+}
+/* SSO 登录按钮：是个 <a>，需补足 btn 的居中与无下划线 */
+.login-sso {
+  text-align: center;
+  text-decoration: none;
+}
 .brand {
   text-align: center;
   margin-bottom: 8px;

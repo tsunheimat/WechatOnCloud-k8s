@@ -6,6 +6,12 @@ export interface PanelUser {
   createdAt: string;
   allowedInstances: string[]; // admin 为空数组（隐式全部）
   mustChangePassword?: boolean; // 仍在用默认密码时为 true
+  authProvider?: 'local' | 'oidc'; // 账户来源：本地用户名密码 / 外部 SSO
+}
+
+// 登录页用：是否启用 SSO 及按钮文案（未登录即可读）
+export interface AuthConfig {
+  oidc: { enabled: boolean; displayName: string };
 }
 
 export type WechatPhase = 'idle' | 'downloading' | 'extracting' | 'installing' | 'done' | 'error';
@@ -119,9 +125,11 @@ async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
 
 export const api = {
   me: () => req<{ user: PanelUser }>('/api/auth/me'),
+  authConfig: () => req<AuthConfig>('/api/auth/config'),
   login: (username: string, password: string) =>
     req<{ user: PanelUser }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
-  logout: () => req('/api/auth/logout', { method: 'POST' }),
+  // 退出：OIDC 账户在启用 RP-initiated logout 时返回 IdP 注销地址，前端整页跳转过去。
+  logout: () => req<{ ok: true; redirect?: string }>('/api/auth/logout', { method: 'POST' }),
   changePassword: (oldPassword: string, newPassword: string) =>
     req('/api/account/password', { method: 'POST', body: JSON.stringify({ oldPassword, newPassword }) }),
 

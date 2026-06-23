@@ -36,8 +36,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const logout = async () => {
-    await api.logout().catch(() => {});
+    // SSO 账户在启用 RP-initiated logout 时，服务端返回 IdP 退出地址，整页跳过去彻底登出。
+    const res = await api.logout().catch(() => null);
     setUser(null);
+    if (res?.redirect) {
+      window.location.assign(res.redirect);
+    }
   };
 
   return <Ctx.Provider value={{ user, loading, refresh, login, logout }}>{children}</Ctx.Provider>;
