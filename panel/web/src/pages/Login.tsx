@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth';
 import { api } from '../api';
 import { PasswordInput } from '../ui';
+import { SsoIcon } from '../SsoIcon';
 
 export default function Login() {
   const { login } = useAuth();
@@ -11,8 +12,8 @@ export default function Login() {
   const [password, setPassword] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
-  // SSO：是否启用 + 按钮文案（来自 /api/auth/config）
-  const [sso, setSso] = useState<{ enabled: boolean; displayName: string }>({ enabled: false, displayName: 'SSO' });
+  // SSO：是否启用 + 按钮文案 + 图标（来自 /api/auth/config）
+  const [sso, setSso] = useState<{ enabled: boolean; displayName: string; icon?: string }>({ enabled: false, displayName: 'SSO' });
 
   useEffect(() => {
     api.authConfig().then((c) => setSso(c.oidc)).catch(() => {});
@@ -69,8 +70,13 @@ export default function Login() {
             <>
               <div className="login-or">或</div>
               {/* 整页跳转到服务端发起 OIDC 授权（非 fetch）：会被重定向到 IdP */}
-              <a className="btn login-sso" href="/api/auth/oidc/login">
-                使用 {sso.displayName} 登录
+              <a
+                className="btn login-sso"
+                href="/api/auth/oidc/login"
+                style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
+              >
+                <SsoIcon icon={sso.icon} size={18} />
+                <span>使用 {sso.displayName} 登录</span>
               </a>
             </>
           )}

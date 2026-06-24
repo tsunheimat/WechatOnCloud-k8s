@@ -26,6 +26,7 @@ export interface OidcConfig {
   groupsClaim: string;
   adminGroup: string; // 空 = 永不据 OIDC 赋予管理员
   displayName: string; // 登录按钮文案
+  icon: string; // 登录按钮图标预设 key（见前端 SsoIcon）；可被面板内设置覆盖
   postLogout: boolean; // 退出时是否跳到 IdP 的 end_session_endpoint
 }
 
@@ -52,6 +53,7 @@ export function readOidcConfig(env: NodeJS.ProcessEnv = process.env): OidcConfig
     groupsClaim: (env.OIDC_GROUPS_CLAIM || 'groups').trim(),
     adminGroup: (env.OIDC_ADMIN_GROUP || '').trim(),
     displayName: (env.OIDC_DISPLAY_NAME || 'SSO').trim() || 'SSO',
+    icon: (env.OIDC_ICON || 'sso').trim() || 'sso',
     postLogout: parseBool(env.OIDC_POST_LOGOUT, false),
   };
 }

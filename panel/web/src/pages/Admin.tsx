@@ -3,8 +3,10 @@ import { useNavigate } from 'react-router-dom';
 import Cropper from 'react-easy-crop';
 import { api, APP_LABELS, appProfile, type PanelUser, type InstanceWithStatus, type VolEntry, type AppType, type VersionInfo } from '../api';
 import { InstanceIcon, ICON_CHOICES } from '../AppIcon';
+import { SsoIcon, SSO_ICON_CHOICES } from '../SsoIcon';
 import { useUI, PasswordInput } from '../ui';
 import { useAuth } from '../auth';
+import type { OidcSettings } from '../api';
 
 const BUSY_PHASES = ['downloading', 'extracting', 'installing'];
 
@@ -258,6 +260,98 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
             {info.error && ` · ${info.error}`}
           </p>
         )}
+      </div>
+    </>
+  );
+}
+
+// 「单点登录 / SSO」（仅管理员，仅在 OIDC 已启用时显示）：自助注册开关 / 绑定开关 / 登录按钮图标。
+// 三者覆盖对应环境变量默认；连接配置（issuer/client 等）仍只走环境变量，这里不涉及。
+function OidcSection() {
+  const { toast } = useUI();
+  const [s, setS] = useState<OidcSettings | null>(null);
+  const [hidden, setHidden] = useState(false); // OIDC 未启用：整段不渲染
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    api
+      .getOidcSettings()
+      .then((v) => {
+        setS(v);
+        if (!v.enabled) setHidden(true);
+      })
+      .catch(() => setHidden(true));
+  }, []);
+
+  const save = async (patch: { allowRegister?: boolean; allowBind?: boolean; icon?: string }) => {
+    setSaving(true);
+    try {
+      const r = await api.setOidcSettings(patch);
+      setS((prev) => (prev ? { ...prev, ...r } : prev));
+      toast('已保存', 'ok');
+    } catch (e: any) {
+      toast(e.message || '保存失败', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (hidden || !s) return null;
+
+  const Toggle = ({ on, onClick, label }: { on: boolean; onClick: () => void; label: string }) => (
+    <button className={'chip chip-toggle' + (on ? ' on' : '')} disabled={saving} onClick={onClick}>
+      {label}：{on ? '开' : '关'}
+    </button>
+  );
+
+  return (
+    <>
+      <div className="section-row" style={{ marginTop: 22 }}>
+        <span className="section-title">单点登录 / SSO</span>
+        <span className="muted small">
+          身份提供商「{s.displayName}」已接入。连接配置仍由环境变量管理；下列开关与图标可在此实时调整。
+        </span>
+      </div>
+      <div className="settings-block">
+        <div className="s-field">
+          <span className="field-label">自助注册</span>
+          <div className="chip-row">
+            <Toggle on={s.allowRegister} label="允许首次 SSO 登录新建账户" onClick={() => save({ allowRegister: !s.allowRegister })} />
+          </div>
+        </div>
+        <p className="s-foot" style={{ marginTop: 4 }}>
+          关闭后，未登记的 SSO 用户首次登录将无法新建账户，只能绑定到已有账户（若也关闭绑定，则需管理员预先登记）。
+        </p>
+
+        <div className="s-field" style={{ marginTop: 14 }}>
+          <span className="field-label">账户绑定</span>
+          <div className="chip-row">
+            <Toggle on={s.allowBind} label="允许把 SSO 绑定到已有账户" onClick={() => save({ allowBind: !s.allowBind })} />
+          </div>
+        </div>
+        <p className="s-foot" style={{ marginTop: 4 }}>
+          开启后，用户首次 SSO 登录时可输入某个<strong>已有账户</strong>的用户名+密码完成绑定（含管理员账户），之后即可用 SSO 登录该账户。
+        </p>
+
+        <div className="s-field" style={{ marginTop: 14 }}>
+          <span className="field-label">登录图标</span>
+          <div className="chip-row">
+            {SSO_ICON_CHOICES.map((c) => (
+              <button
+                key={c.key}
+                className={'chip chip-toggle' + (s.icon === c.key ? ' on' : '')}
+                disabled={saving}
+                onClick={() => save({ icon: c.key })}
+                title={c.label}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
+              >
+                <SsoIcon icon={c.key} size={16} />
+                {c.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <p className="s-foot" style={{ marginTop: 4 }}>登录页「使用 {s.displayName} 登录」按钮上显示的图标。</p>
       </div>
     </>
   );
@@ -574,6 +668,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                     <div className="inst-head">
                       <span className="inst-name">{u.username}</span>
                       {u.authProvider === 'oidc' && <span className="tag" title="经 SSO 登录的账户，密码由身份提供商管理">SSO</span>}
+                      {u.ssoLinked && <span className="tag" title="本地账户已绑定 SSO：可本地口令登录，也可经 SSO 登录">已绑定 SSO</span>}
                       {u.disabled ? <span className="tag tag-off">已禁用</span> : <span className="tag tag-on">正常</span>}
                     </div>
                     <div className="inst-sub">{u.allowedInstances.length > 0 ? `可访问 ${u.allowedInstances.length} 个实例` : '未分配实例'}</div>
@@ -625,6 +720,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                           <span className="inst-name">{u.username}</span>
                           <span className="tag">管理员</span>
                           {isOidc && <span className="tag">SSO</span>}
+                          {u.ssoLinked && <span className="tag">已绑定 SSO</span>}
                           {u.disabled && <span className="tag tag-off">已禁用</span>}
                         </div>
                         <div className="inst-sub">{isOidc ? '由身份提供商分组授予管理员' : '本地管理员账户'}</div>
@@ -718,6 +814,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
             <div className="inst-head">
               <span className="inst-name">{user?.username}</span>
               {user?.authProvider === 'oidc' && <span className="tag">SSO</span>}
+              {user?.ssoLinked && <span className="tag">已绑定 SSO</span>}
               {isAdmin ? <span className="tag">管理员</span> : <span className="tag tag-on">子账号</span>}
             </div>
             <div className="inst-sub">{isAdmin ? '可访问全部实例' : `可访问 ${user?.allowedInstances.length ?? 0} 个实例`}</div>
@@ -734,6 +831,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
           </div>
         </div>
 
+        {isAdmin && <OidcSection />}
         {isAdmin && <DiagnosticsSection runtimeKind={runtimeKind} />}
         <AboutSection isAdmin={isAdmin} />
       </main>

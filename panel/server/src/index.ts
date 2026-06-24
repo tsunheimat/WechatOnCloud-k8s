@@ -13,6 +13,9 @@ import {
   findById,
   verifyPassword,
   upsertOidcUser,
+  findByOidcSubject,
+  getOidcSettings,
+  setOidcSettings,
   userAuthProvider,
   publicUser,
   listUsers,
@@ -78,6 +81,8 @@ import {
 } from './runtime/index.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
 import { readOidcConfig, buildAuthUrl, handleCallback, endSessionUrl, type OidcTx } from './oidc.js';
+import { createPendingLink } from './oidc-link.js';
+import { registerOidcBindRoutes } from './oidc-routes.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
 import { pickPublicHost } from './request-host.js';
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
@@ -93,6 +98,10 @@ const COOKIE = 'woc_sess';
 // OIDC 登录事务用的短时签名 cookie（state/nonce/PKCE），见 oidc.ts。仅作用于回调路径。
 const OIDC_TX_COOKIE = 'woc_oidc';
 const OIDC_TX_PATH = '/api/auth/oidc';
+// 新 SSO 身份「待绑定」的短时签名 cookie：值为指向服务端暂存（oidc-link.ts）的随机 token。
+const OIDC_LINK_COOKIE = 'woc_oidc_link';
+// 登录按钮可选的 SSO 图标预设 key（须与前端 SsoIcon 一致）；非法/未知一律回退 'sso'。
+const OIDC_ICON_KEYS = ['sso', 'google', 'microsoft', 'github', 'gitlab', 'authentik', 'keycloak', 'okta', 'apple'];
 // 签名密钥：优先 env（设它可让滚动重启期间进行中的 SSO 登录不中断），否则随进程生成。
 const COOKIE_SECRET = process.env.PANEL_COOKIE_SECRET || randomBytes(32).toString('hex');
 const oidc = readOidcConfig();
@@ -212,9 +221,24 @@ app.get('/api/auth/me', async (req, reply) => {
 });
 
 // ---------- OIDC / SSO 登录 ----------
-// 登录页用：未登录即可读，告诉前端是否启用 SSO 及按钮文案（启用时多渲染一颗「用 SSO 登录」）。
+// 面板内可调项的「有效值」：管理员设置覆盖优先，未设置则跟随对应环境变量默认（见 store.getOidcSettings）。
+function oidcAllowRegister(): boolean {
+  const o = getOidcSettings();
+  return o.allowRegister === undefined ? oidc.autoCreate : o.allowRegister;
+}
+function oidcAllowBind(): boolean {
+  const o = getOidcSettings();
+  return o.allowBind === undefined ? true : o.allowBind; // 默认允许绑定到已有账户
+}
+function oidcIcon(): string {
+  const o = getOidcSettings();
+  const v = o.icon || oidc.icon;
+  return OIDC_ICON_KEYS.includes(v) ? v : 'sso';
+}
+
+// 登录页用：未登录即可读，告诉前端是否启用 SSO 及按钮文案/图标（启用时多渲染一颗「用 SSO 登录」）。
 app.get('/api/auth/config', async () => {
-  return { oidc: { enabled: oidc.enabled, displayName: oidc.displayName } };
+  return { oidc: { enabled: oidc.enabled, displayName: oidc.displayName, icon: oidcIcon() } };
 });
 
 // 请求对外可见的 host（含端口），用于拼 OIDC 回调 / 注销地址。委托给 request-host：只采信**自身也
@@ -278,29 +302,66 @@ app.get('/api/auth/oidc/callback', async (req, reply) => {
   }
   try {
     const identity = await handleCallback(oidc, (req.query as Record<string, unknown>) ?? {}, tx);
-    const user = upsertOidcUser(identity, {
-      autoCreate: oidc.autoCreate,
-      mapAdmin: !!oidc.adminGroup,
-      // userinfo 抖动导致分组拿不全时不据此降级既有管理员（见 handleCallback.groupsReliable）。
-      adminReliable: identity.groupsReliable,
-    });
-    if (user.disabled) {
-      appendPanelLog('WARN', `OIDC 登录被拒：账户「${user.username}」已禁用`);
-      return fail('该账户已被禁用，请联系管理员');
+    const known = findByOidcSubject(identity.subject);
+    if (known) {
+      // 已登记身份：每次登录对账（邮箱/分组角色，仅对纯 OIDC 账户），建会话直接放行。
+      const user = upsertOidcUser(identity, {
+        autoCreate: false, // 已登记，不涉及建号
+        mapAdmin: !!oidc.adminGroup,
+        // userinfo 抖动导致分组拿不全时不据此降级既有管理员（见 handleCallback.groupsReliable）。
+        adminReliable: identity.groupsReliable,
+      });
+      if (user.disabled) {
+        appendPanelLog('WARN', `OIDC 登录被拒：账户「${user.username}」已禁用`);
+        return fail('该账户已被禁用，请联系管理员');
+      }
+      // 存下 id_token 供登出时作 id_token_hint（RP-initiated logout）。
+      const token = createSession(user.id, identity.idToken);
+      reply.setCookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: cookieSecure(req), path: '/', maxAge: 60 * 60 * 12 });
+      appendPanelLog('INFO', `OIDC 登录：${user.username}（${user.role}）`);
+      // 只允许站内绝对路径回跳；排除协议相对（//host、/\\host）以防开放重定向。
+      // 目前 returnTo 恒为 '/'（且在签名 cookie 内不可篡改），此处为纵深防御，挡未来引入 ?next= 之类的回归。
+      const rt = tx.returnTo;
+      const back = typeof rt === 'string' && rt.startsWith('/') && !rt.startsWith('//') && !rt.startsWith('/\\') ? rt : '/';
+      return reply.redirect(back);
     }
-    // 存下 id_token 供登出时作 id_token_hint（RP-initiated logout）。
-    const token = createSession(user.id, identity.idToken);
-    reply.setCookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: cookieSecure(req), path: '/', maxAge: 60 * 60 * 12 });
-    appendPanelLog('INFO', `OIDC 登录：${user.username}（${user.role}）`);
-    // 只允许站内绝对路径回跳；排除协议相对（//host、/\\host）以防开放重定向。
-    // 目前 returnTo 恒为 '/'（且在签名 cookie 内不可篡改），此处为纵深防御，挡未来引入 ?next= 之类的回归。
-    const rt = tx.returnTo;
-    const back = typeof rt === 'string' && rt.startsWith('/') && !rt.startsWith('//') && !rt.startsWith('/\\') ? rt : '/';
-    return reply.redirect(back);
+    // 既往未登记的新身份：先不建号，暂存身份并引导到自助绑定页（新建账户 / 绑定到已有账户）。
+    const linkToken = createPendingLink({
+      subject: identity.subject,
+      username: identity.username,
+      email: identity.email,
+      isAdmin: identity.isAdmin,
+      groupsReliable: identity.groupsReliable,
+      idToken: identity.idToken,
+    });
+    reply.setCookie(OIDC_LINK_COOKIE, linkToken, {
+      signed: true,
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: cookieSecure(req),
+      path: OIDC_TX_PATH,
+      maxAge: 600, // 10 分钟内完成绑定/新建
+    });
+    appendPanelLog('INFO', `OIDC 新身份待绑定：${identity.username}`);
+    return reply.redirect('/oidc/link');
   } catch (e: any) {
     appendPanelLog('WARN', `OIDC 登录失败：${e?.message || e}`);
     return fail(e?.message || 'SSO 登录失败');
   }
+});
+
+// 待绑定信息 + 自助绑定/新建路由（/api/auth/oidc/pending、/api/auth/oidc/link）。逻辑抽到 oidc-routes.ts
+// 以便用 app.inject() 做无网络端到端测试；这里只注入开关取值/ cookie 名/ HTTPS 自适应/日志等依赖。
+registerOidcBindRoutes(app, {
+  enabled: oidc.enabled,
+  adminGroup: oidc.adminGroup,
+  linkCookie: OIDC_LINK_COOKIE,
+  linkCookiePath: OIDC_TX_PATH,
+  sessionCookie: COOKIE,
+  allowRegister: oidcAllowRegister,
+  allowBind: oidcAllowBind,
+  cookieSecure,
+  log: (level, msg) => appendPanelLog(level, msg),
 });
 
 // ---------- 版本与更新检测 ----------
@@ -349,6 +410,40 @@ app.post('/api/admin/desktop-theme', async (req, reply) => {
   setDesktopDark(dark);
   appendPanelLog('INFO', `实例深色设为 ${dark ? '深色' : '浅色'}（浏览器实例重启后生效）`);
   return { ok: true, dark };
+});
+
+// ---------- SSO / OIDC 面板内设置（仅管理员）----------
+// 自助注册开关 / 绑定开关 / 登录按钮图标。三者均覆盖对应环境变量默认；返回有效值 + 覆盖态 + 环境默认，
+// 便于设置页展示「跟随环境默认 / 已覆盖」。连接配置（issuer/client 等）仍只走环境变量，这里不暴露/不可改。
+app.get('/api/admin/oidc-settings', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const o = getOidcSettings();
+  return {
+    enabled: oidc.enabled,
+    displayName: oidc.displayName,
+    allowRegister: oidcAllowRegister(),
+    allowBind: oidcAllowBind(),
+    icon: oidcIcon(),
+    overrides: { allowRegister: o.allowRegister ?? null, allowBind: o.allowBind ?? null, icon: o.icon ?? null },
+    defaults: { allowRegister: oidc.autoCreate, allowBind: true, icon: OIDC_ICON_KEYS.includes(oidc.icon) ? oidc.icon : 'sso' },
+  };
+});
+app.post('/api/admin/oidc-settings', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  if (!oidc.enabled) return reply.code(400).send({ error: 'OIDC 未启用' });
+  const b = (req.body as any) ?? {};
+  const patch: { allowRegister?: boolean | null; allowBind?: boolean | null; icon?: string | null } = {};
+  // 各字段：传 null 表示「恢复跟随环境默认」，传值表示设覆盖，不传则保持不变。
+  if ('allowRegister' in b) patch.allowRegister = b.allowRegister === null ? null : !!b.allowRegister;
+  if ('allowBind' in b) patch.allowBind = b.allowBind === null ? null : !!b.allowBind;
+  if ('icon' in b) {
+    if (b.icon === null || b.icon === '') patch.icon = null;
+    else if (typeof b.icon === 'string' && OIDC_ICON_KEYS.includes(b.icon)) patch.icon = b.icon;
+    else return reply.code(400).send({ error: '图标预设不合法' });
+  }
+  setOidcSettings(patch);
+  appendPanelLog('INFO', `更新 SSO 设置：${JSON.stringify(patch)}`);
+  return { allowRegister: oidcAllowRegister(), allowBind: oidcAllowBind(), icon: oidcIcon() };
 });
 
 // ---------- 自助改密 ----------

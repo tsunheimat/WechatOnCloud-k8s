@@ -7,11 +7,31 @@ export interface PanelUser {
   allowedInstances: string[]; // admin 为空数组（隐式全部）
   mustChangePassword?: boolean; // 仍在用默认密码时为 true
   authProvider?: 'local' | 'oidc'; // 账户来源：本地用户名密码 / 外部 SSO
+  ssoLinked?: boolean; // 本地账户额外绑定了 SSO 身份（混合账户：可本地口令登录，也可 SSO 登录）
 }
 
-// 登录页用：是否启用 SSO 及按钮文案（未登录即可读）
+// 登录页用：是否启用 SSO 及按钮文案/图标（未登录即可读）
 export interface AuthConfig {
-  oidc: { enabled: boolean; displayName: string };
+  oidc: { enabled: boolean; displayName: string; icon?: string };
+}
+
+// 新 SSO 身份首次登录后的「待绑定」信息（/oidc/link 页用）
+export interface OidcPending {
+  username: string;
+  email?: string;
+  allowRegister: boolean; // 允许新建账户
+  allowBind: boolean; // 允许绑定到已有账户
+}
+
+// 管理员：SSO/OIDC 面板内设置（有效值 + 覆盖态 + 环境默认）
+export interface OidcSettings {
+  enabled: boolean;
+  displayName: string;
+  allowRegister: boolean;
+  allowBind: boolean;
+  icon: string;
+  overrides: { allowRegister: boolean | null; allowBind: boolean | null; icon: string | null };
+  defaults: { allowRegister: boolean; allowBind: boolean; icon: string };
 }
 
 export type WechatPhase = 'idle' | 'downloading' | 'extracting' | 'installing' | 'done' | 'error';
@@ -113,8 +133,11 @@ async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    // 会话过期：除登录/探测接口外，任意接口收到 401 都说明 cookie 失效，直接回登录页（避免页面卡在错误态）
-    const isAuthProbe = path.includes('/api/auth/login') || path.includes('/api/auth/me');
+    // 会话过期：除登录/探测接口外，任意接口收到 401 都说明 cookie 失效，直接回登录页（避免页面卡在错误态）。
+    // OIDC 自助绑定流程（/api/auth/oidc/*）本就是未登录态、其 401 表示「绑定用的用户名或密码错误」而非会话过期，
+    // 必须在绑定页就地回显，不能跳走，故一并豁免。
+    const isAuthProbe =
+      path.includes('/api/auth/login') || path.includes('/api/auth/me') || path.includes('/api/auth/oidc/');
     if (res.status === 401 && !isAuthProbe && location.pathname !== '/login') {
       location.assign('/login');
     }
@@ -132,6 +155,20 @@ export const api = {
   logout: () => req<{ ok: true; redirect?: string }>('/api/auth/logout', { method: 'POST' }),
   changePassword: (oldPassword: string, newPassword: string) =>
     req('/api/account/password', { method: 'POST', body: JSON.stringify({ oldPassword, newPassword }) }),
+
+  // SSO 自助绑定流程（首次 SSO 登录、subject 尚未登记时）
+  oidcPending: () => req<OidcPending>('/api/auth/oidc/pending'),
+  oidcLinkCreate: () => req<{ ok: true }>('/api/auth/oidc/link', { method: 'POST', body: JSON.stringify({ mode: 'create' }) }),
+  oidcLinkBind: (username: string, password: string) =>
+    req<{ ok: true }>('/api/auth/oidc/link', { method: 'POST', body: JSON.stringify({ mode: 'bind', username, password }) }),
+
+  // 管理员：SSO/OIDC 面板内设置（注册开关 / 绑定开关 / 登录图标）。patch 里某字段传 null = 恢复跟随环境默认。
+  getOidcSettings: () => req<OidcSettings>('/api/admin/oidc-settings'),
+  setOidcSettings: (patch: { allowRegister?: boolean | null; allowBind?: boolean | null; icon?: string | null }) =>
+    req<{ allowRegister: boolean; allowBind: boolean; icon: string }>('/api/admin/oidc-settings', {
+      method: 'POST',
+      body: JSON.stringify(patch),
+    }),
 
   // 版本与更新检测
   getVersion: () => req<VersionInfo>('/api/version'),

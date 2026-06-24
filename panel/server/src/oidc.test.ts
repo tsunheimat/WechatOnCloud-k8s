@@ -23,6 +23,7 @@ function cfg(over: Partial<OidcConfig> = {}): OidcConfig {
     groupsClaim: 'groups',
     adminGroup: '',
     displayName: 'SSO',
+    icon: 'sso',
     postLogout: false,
     ...over,
   };
@@ -49,6 +50,7 @@ test('readOidcConfig: enabled only when issuer+clientId+secret all present', () 
   assert.equal(c.usernameClaim, 'preferred_username'); // default
   assert.equal(c.autoCreate, true); // default
   assert.equal(c.displayName, 'SSO'); // default
+  assert.equal(c.icon, 'sso'); // default
 });
 
 test('readOidcConfig: overrides and AUTO_CREATE=false honored', () => {
@@ -60,11 +62,13 @@ test('readOidcConfig: overrides and AUTO_CREATE=false honored', () => {
     OIDC_ADMIN_GROUP: 'woc-admins',
     OIDC_DISPLAY_NAME: 'Authentik',
     OIDC_USERNAME_CLAIM: 'email',
+    OIDC_ICON: 'authentik',
   });
   assert.equal(c.autoCreate, false);
   assert.equal(c.adminGroup, 'woc-admins');
   assert.equal(c.displayName, 'Authentik');
   assert.equal(c.usernameClaim, 'email');
+  assert.equal(c.icon, 'authentik');
 });
 
 test('resolveUsername: configured claim wins, then falls back preferred_username→email→sub', () => {

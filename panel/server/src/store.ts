@@ -75,6 +75,11 @@ export interface Settings {
   // 实例桌面深色模式：由面板顶栏的主题开关统一控制（管理员）。true=实例内应用走深色。
   // 既作为新建/重启实例的初始明暗（经容器环境 WOC_DARK 下发），也用于对运行中实例实时切换。
   desktopDark?: boolean;
+  // SSO/OIDC 面板内可调项（管理员设置页）。各项覆盖对应环境变量默认；undefined = 跟随环境默认。
+  // 有效值的合并（与环境默认）在 index.ts 进行，store 只存「覆盖」本身。
+  oidcAllowRegister?: boolean; // 允许 SSO 自助注册（首次登录可新建账户）；默认随 OIDC_AUTO_CREATE
+  oidcAllowBind?: boolean; // 允许把 SSO 身份绑定到已有本地账户（默认开）
+  oidcIcon?: string; // 登录按钮的 SSO 图标预设 key（默认随 OIDC_ICON）
 }
 
 interface Data {
@@ -184,6 +189,31 @@ export function setDesktopDark(v: boolean) {
   persist();
 }
 
+// SSO/OIDC 面板内可调项的「覆盖」原值（undefined = 跟随环境默认，由 index.ts 合并）。
+export function getOidcSettings(): { allowRegister?: boolean; allowBind?: boolean; icon?: string } {
+  const s = getSettings();
+  return { allowRegister: s.oidcAllowRegister, allowBind: s.oidcAllowBind, icon: s.oidcIcon };
+}
+
+// 写入/清除覆盖：传 boolean/string 设覆盖，传 null 删覆盖（恢复跟随环境默认），不传（undefined）则不动。
+export function setOidcSettings(patch: { allowRegister?: boolean | null; allowBind?: boolean | null; icon?: string | null }) {
+  const s = getSettings();
+  if (patch.allowRegister !== undefined) {
+    if (patch.allowRegister === null) delete s.oidcAllowRegister;
+    else s.oidcAllowRegister = !!patch.allowRegister;
+  }
+  if (patch.allowBind !== undefined) {
+    if (patch.allowBind === null) delete s.oidcAllowBind;
+    else s.oidcAllowBind = !!patch.allowBind;
+  }
+  if (patch.icon !== undefined) {
+    if (patch.icon === null || patch.icon === '') delete s.oidcIcon;
+    else s.oidcIcon = patch.icon;
+  }
+  persist();
+  return getOidcSettings();
+}
+
 // ---------- 用户 ----------
 export function userAuthProvider(u: User): AuthProvider {
   return u.authProvider || (u.oidcSubject ? 'oidc' : 'local');
@@ -199,6 +229,9 @@ export function publicUser(u: User) {
     allowedInstances: u.role === 'admin' ? [] : u.allowedInstances,
     mustChangePassword: !!u.mustChangePassword,
     authProvider: userAuthProvider(u),
+    // 「混合账户」：本地账户额外绑定了 SSO 身份（authProvider 仍为 local，但可经 SSO 登录）。
+    // 纯 OIDC 账户的 SSO 来源已由 authProvider==='oidc' 表达，这里只标记本地账户上的绑定。
+    ssoLinked: userAuthProvider(u) === 'local' && !!u.oidcSubject,
   };
 }
 
@@ -258,6 +291,10 @@ export function upsertOidcUser(
   const adminReliable = opts.adminReliable !== false; // 缺省可信
   const existing = findByOidcSubject(identity.subject);
   if (existing) {
+    // 「混合账户」（authProvider=local + oidcSubject，由自助绑定流程产生）：角色与口令由本地管理，OIDC
+    // 不回算——否则把 SSO 绑定到本地管理员后，会因未配/不在管理员分组而被按分组误降级（也会丢本地口令登录）。
+    // 仅纯 OIDC（JIT 建号）账户才据分组对账邮箱/角色。
+    if (userAuthProvider(existing) !== 'oidc') return existing;
     // 每次登录对账：刷新邮箱，并据当前配置重算角色（仅作用于 OIDC 账户）。
     let changed = false;
     if (identity.email && existing.email !== identity.email) {
@@ -301,6 +338,27 @@ export function upsertOidcUser(
     allowedInstances: [],
   };
   data.users.push(u);
+  persist();
+  return u;
+}
+
+// 把一次 SSO 身份（subject/email）绑定到已有的本地账户，形成「混合账户」：既能本地口令登录，也能 SSO 登录。
+// 仅由自助绑定流程调用——用户首次 SSO 登录、又用既有账户的用户名口令通过校验后，才把该 subject 绑定上来。
+// 刻意保持 authProvider='local'：
+//   - 不丢本地口令登录（verifyPassword 仍据本地口令放行）；
+//   - 本地管理员的「保命」保护（永不可禁用/删除、initStore 兜底）继续生效——故允许绑定到管理员账户；
+//   - upsertOidcUser 对这类账户跳过「据分组回算角色」（见上），避免被 IdP 分组误降级。
+// 守卫：目标须为本地账户（非纯 OIDC）、尚未绑定其它 subject；该 subject 也不能已被别的账户占用。
+export function bindOidcToUser(userId: string, identity: { subject: string; email?: string }): User {
+  const u = findById(userId);
+  if (!u) throw new Error('用户不存在');
+  if (userAuthProvider(u) === 'oidc') throw new Error('该账户本身即 SSO 账户，无需绑定');
+  if (u.oidcSubject && u.oidcSubject !== identity.subject) throw new Error('该账户已绑定其它 SSO 身份');
+  const other = findByOidcSubject(identity.subject);
+  if (other && other.id !== u.id) throw new Error('该 SSO 身份已绑定到其它账户');
+  u.oidcSubject = identity.subject;
+  if (identity.email) u.email = identity.email;
+  u.authProvider = 'local'; // 维持本地账户：保留本地口令登录与本地管理员保护
   persist();
   return u;
 }

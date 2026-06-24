@@ -145,6 +145,49 @@ test('setDisabled/deleteUser: OIDC admins are revocable, local admin stays prote
   assert.equal(store.findByOidcSubject('sub-admin'), undefined);
 });
 
+test('bindOidcToUser: links an SSO identity to an existing local account (hybrid: keeps local password + provider)', () => {
+  store.createSub('bindme', 'pw-123456');
+  const target = store.findByUsername('bindme')!;
+  const u = store.bindOidcToUser(target.id, { subject: 'sub-bind', email: 'bound@example.com' });
+  assert.equal(u.id, target.id); // same account, not a new one
+  assert.equal(u.oidcSubject, 'sub-bind');
+  assert.equal(u.email, 'bound@example.com');
+  assert.equal(store.userAuthProvider(u), 'local'); // stays local → local password login still works
+  assert.equal(store.verifyPassword(u, 'pw-123456'), true);
+  // now SSO login resolves to this same account by subject (no new account created)
+  assert.equal(store.findByOidcSubject('sub-bind')!.id, target.id);
+  // public shape flags the link without changing authProvider
+  assert.equal(store.publicUser(u).authProvider, 'local');
+  assert.equal(store.publicUser(u).ssoLinked, true);
+});
+
+test('upsertOidcUser: does NOT reconcile role for a linked local account (no demote of a bound admin)', () => {
+  // a bound local admin must keep its admin role across SSO logins even when no admin-group maps it
+  store.createSub('boundadmin', 'pw-123456');
+  const u0 = store.findByUsername('boundadmin')!;
+  // make it a (local) admin and bind an SSO identity
+  store.setUserInstances(u0.id, []); // no-op, just exercise lookup
+  u0.role = 'admin';
+  store.bindOidcToUser(u0.id, { subject: 'sub-boundadmin' });
+  // SSO login with mapAdmin=false would force a pure-OIDC account to sub — but a linked local account is left alone
+  const u = store.upsertOidcUser({ subject: 'sub-boundadmin', username: 'whatever', isAdmin: false }, { autoCreate: false, mapAdmin: false });
+  assert.equal(u.id, u0.id);
+  assert.equal(u.role, 'admin'); // preserved
+  assert.equal(store.userAuthProvider(u), 'local'); // still a local hybrid account
+});
+
+test('bindOidcToUser: rejects rebinding a different subject or a subject already used elsewhere', () => {
+  store.createSub('bindguard', 'pw-123456');
+  const a = store.findByUsername('bindguard')!;
+  store.bindOidcToUser(a.id, { subject: 'sub-guard-1' });
+  // same account, different subject → refuse (one local account binds at most one SSO identity)
+  assert.throws(() => store.bindOidcToUser(a.id, { subject: 'sub-guard-2' }), /已绑定其它 SSO/);
+  // a second account cannot claim a subject already bound to the first
+  store.createSub('bindguard2', 'pw-123456');
+  const b = store.findByUsername('bindguard2')!;
+  assert.throws(() => store.bindOidcToUser(b.id, { subject: 'sub-guard-1' }), /已绑定到其它账户/);
+});
+
 test('upsertOidcUser: unknown subject rejected when autoCreate is off', () => {
   assert.throws(
     () => store.upsertOidcUser(ident({ subject: 'sub-unprovisioned', username: 'newcomer' }), { autoCreate: false, mapAdmin: false }),
