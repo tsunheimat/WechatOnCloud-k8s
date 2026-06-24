@@ -80,7 +80,7 @@ import {
   volRestoreArchive,
 } from './runtime/index.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
-import { readOidcConfig, buildAuthUrl, handleCallback, endSessionUrl, type OidcTx } from './oidc.js';
+import { readOidcConfig, buildAuthUrl, handleCallback, endSessionUrl, shouldRpLogout, type OidcTx } from './oidc.js';
 import { createPendingLink } from './oidc-link.js';
 import { registerOidcBindRoutes } from './oidc-routes.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
@@ -197,14 +197,15 @@ app.post('/api/auth/login', async (req, reply) => {
 });
 
 app.post('/api/auth/logout', async (req, reply) => {
-  const u = currentUser(req);
   const token = req.cookies?.[COOKIE];
   const idTokenHint = getSession(token)?.idToken; // 销毁会话前取出 id_token 作登出 hint
   destroySession(token);
   reply.clearCookie(COOKIE, { path: '/' });
-  // 配置了 RP-initiated logout 时，对 OIDC 账户返回 IdP 退出地址，前端整页跳转过去（彻底登出 IdP）。
+  // 配置了 RP-initiated logout 时，对「经 SSO 建立的会话」（会话里存了 id_token）返回 IdP 退出地址，前端整页
+  // 跳过去彻底登出 IdP。按「会话是否经 SSO 建立」而非账户来源判断——绑定到本地账户的混合账户 authProvider 仍是
+  // local，但 SSO 登录的会话同样带 id_token，应一并登出 IdP（见 oidc.shouldRpLogout）。
   // host 取不到合法值就跳过重定向（本地会话已清，注销照样成立），不据伪造头拼 post_logout_redirect_uri。
-  if (oidc.enabled && oidc.postLogout && u && userAuthProvider(u) === 'oidc') {
+  if (shouldRpLogout(oidc, idTokenHint)) {
     const origin = publicHost(req);
     if (origin) {
       const redirect = await endSessionUrl(oidc, `${req.protocol}://${origin}/login`, idTokenHint);

@@ -7,6 +7,7 @@ import {
   resolveGroups,
   isAdminFromGroups,
   normalizeIdentity,
+  shouldRpLogout,
   type OidcConfig,
 } from './oidc.js';
 
@@ -93,6 +94,18 @@ test('resolveGroups: array, comma/space string, or absent', () => {
   assert.deepEqual(resolveGroups({}, cfg()), []);
   // non-string entries filtered out
   assert.deepEqual(resolveGroups({ groups: ['a', 2, null, 'b'] as unknown[] }, cfg()), ['a', 'b']);
+});
+
+test('shouldRpLogout: keys off the session id_token (SSO-established session), not account provider', () => {
+  // 经 SSO 建立的会话存了 id_token → 跳 IdP 注销（含绑定到本地账户的混合账户，其 authProvider 仍是 local）
+  assert.equal(shouldRpLogout({ enabled: true, postLogout: true }, 'id-token-abc'), true);
+  // 纯本地登录的会话无 id_token → 不跳
+  assert.equal(shouldRpLogout({ enabled: true, postLogout: true }, undefined), false);
+  assert.equal(shouldRpLogout({ enabled: true, postLogout: true }, ''), false);
+  // 未启用 RP-initiated logout → 即便有 id_token 也不跳
+  assert.equal(shouldRpLogout({ enabled: true, postLogout: false }, 'id-token-abc'), false);
+  // OIDC 未启用 → 永不跳
+  assert.equal(shouldRpLogout({ enabled: false, postLogout: true }, 'id-token-abc'), false);
 });
 
 test('isAdminFromGroups: only when adminGroup configured and present', () => {

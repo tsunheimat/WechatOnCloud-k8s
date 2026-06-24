@@ -16,6 +16,7 @@ const store = await import('./store.js');
 const { createPendingLink } = await import('./oidc-link.js');
 const { registerOidcBindRoutes } = await import('./oidc-routes.js');
 const { getSession } = await import('./sessions.js');
+const { shouldRpLogout } = await import('./oidc.js');
 
 store.initStore();
 test.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -52,6 +53,7 @@ async function makeApp() {
       email: q.email || undefined,
       isAdmin: q.isAdmin === '1',
       groupsReliable: true,
+      idToken: q.idToken || undefined,
     });
     reply.setCookie(LINK_COOKIE, token, { signed: true, httpOnly: true, sameSite: 'lax', path: LINK_PATH });
     return { ok: true };
@@ -68,14 +70,18 @@ async function seed(app: Awaited<ReturnType<typeof makeApp>>, q: Record<string, 
   return header.split(';')[0]; // 取 `woc_oidc_link=<signed>`，丢掉 Path/HttpOnly 等属性
 }
 
-// 从 set-cookie 里取出会话 token，并确认其确实指向某登录用户。
-function sessionUserId(res: { headers: Record<string, unknown> }): string | null {
+// 从 set-cookie 里取出会话 token（原始值）。
+function sessionToken(res: { headers: Record<string, unknown> }): string | null {
   const sc = res.headers['set-cookie'];
   const arr = Array.isArray(sc) ? sc : sc ? [sc as string] : [];
   const hit = arr.find((c) => c.startsWith(`${SESSION_COOKIE}=`));
   if (!hit) return null;
-  const token = decodeURIComponent(hit.split(';')[0].slice(SESSION_COOKIE.length + 1));
-  return getSession(token)?.userId ?? null;
+  return decodeURIComponent(hit.split(';')[0].slice(SESSION_COOKIE.length + 1));
+}
+// 取会话指向的登录用户 id。
+function sessionUserId(res: { headers: Record<string, unknown> }): string | null {
+  const token = sessionToken(res);
+  return token ? getSession(token)?.userId ?? null : null;
 }
 
 test('GET /pending: returns IdP-provided username + the current allow flags (no internal fields)', async () => {
@@ -150,6 +156,29 @@ test('POST /link bind: correct credentials link the SSO identity to the existing
   assert.equal(store.userAuthProvider(u), 'local'); // hybrid: keeps local password login
   assert.equal(store.findByOidcSubject('sub-bindok')!.id, before.id);
   assert.equal(sessionUserId(res), before.id); // logged in as the linked account
+  await app.close();
+});
+
+test('POST /link bind: the SSO session for a hybrid (local) account carries id_token so RP-logout fires (regression)', async () => {
+  // 回归：绑定到本地账户的混合账户 authProvider 仍是 local，但经 SSO 建立的会话必须带 id_token，
+  // 这样登出时（按会话 id_token 判断，而非账户来源）才会跳 IdP 注销，避免「只清本地、IdP 仍登录」。
+  allowBind = true;
+  store.createSub('hybridlogout', 'pw-123456');
+  const app = await makeApp();
+  const c = await seed(app, { subject: 'sub-hybrid-logout', username: 'whatever', idToken: 'idtok-hybrid-xyz' });
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/auth/oidc/link',
+    headers: { cookie: c, 'content-type': 'application/json' },
+    payload: { mode: 'bind', username: 'hybridlogout', password: 'pw-123456' },
+  });
+  assert.equal(res.statusCode, 200);
+  const linked = store.findByUsername('hybridlogout')!;
+  assert.equal(store.userAuthProvider(linked), 'local'); // still a local-provider account…
+  const tok = sessionToken(res)!;
+  assert.equal(getSession(tok)!.idToken, 'idtok-hybrid-xyz'); // …yet the session carries the IdP id_token
+  // → the logout gate (keyed off the session id_token, not the account provider) will perform RP-initiated logout
+  assert.equal(shouldRpLogout({ enabled: true, postLogout: true }, getSession(tok)!.idToken), true);
   await app.close();
 });
 

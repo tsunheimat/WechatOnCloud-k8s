@@ -105,6 +105,14 @@ export function isAdminFromGroups(groups: string[], cfg: OidcConfig): boolean {
   return !!cfg.adminGroup && groups.includes(cfg.adminGroup);
 }
 
+// 本次登出是否要跳 IdP 注销（RP-initiated logout）。判据是「会话是否经 SSO 建立」——即会话里有没有存下
+// id_token——而非账户来源。关键：绑定到本地账户的「混合账户」其 authProvider 仍是 local，但用 SSO 登录时
+// 会话同样带 id_token，也应一并登出 IdP；若改按账户来源判断，这类会话只会清掉本地会话、IdP 侧仍登录，
+// 用户可立刻无感重新登入（见 index.ts 登出处理）。纯本地登录的会话无 id_token，自然返回 false。
+export function shouldRpLogout(cfg: Pick<OidcConfig, 'enabled' | 'postLogout'>, idTokenHint?: string): boolean {
+  return cfg.enabled && cfg.postLogout && !!idTokenHint;
+}
+
 export interface OidcIdentity {
   subject: string;
   username: string;
