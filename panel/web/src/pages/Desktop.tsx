@@ -853,7 +853,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               <div className="spinner" />
               <div className="iv-loading-text">正在连接桌面…</div>
               <div className="iv-loading-sub">{profile.enterHint}</div>
-              <div className="iv-loading-sub">拖文件到此处即可上传；声音自动开启，点一下画面即可出声</div>
+              <div className="iv-loading-sub">拖文件到此处即可上传；需要声音时点工具栏「声音」开启</div>
               {!window.isSecureContext && (
                 <div className="iv-loading-warn">当前非 HTTPS 访问，浏览器将禁用麦克风与摄像头（音频播放不受影响）</div>
               )}
