@@ -59,7 +59,9 @@ async function buildCreateOpts(self: any, imageRef: string): Promise<Docker.Cont
   const opts: Docker.ContainerCreateOptions = {
     name: String(self.Name || '').replace(/^\//, '') || PANEL_NAME, // 用目标容器自身名字，而非硬编码常量
     Image: imageRef,
-    Hostname: cfg.Hostname,
+    // 不复刻旧 Hostname：旧容器 hostname=旧短ID，复刻后会让新面板的 os.hostname() 指向【已删除的旧容器】，
+    // 致 ensureNetwork 的 docker.getContainer(hostname()) 404、探测不到网络 → 新建/重启实例落到默认 bridge →
+    // 反代按名访问不到 → 502 黑屏（一键更新用户的黑屏根因）。省略它让 docker 用新容器自身短 ID 作 hostname。
     User: cfg.User || undefined,
     Env: [...finalEnv].map(([k, v]) => `${k}=${v}`),
     Cmd: cfg.Cmd || undefined,
